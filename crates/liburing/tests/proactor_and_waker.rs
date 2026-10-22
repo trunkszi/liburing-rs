@@ -6,6 +6,7 @@
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeSet,
+    mem::ManuallyDrop,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
@@ -405,6 +406,128 @@ fn integration_lifecycle_scenario_drop_cancels_pending_handler_owned_pipe_read()
     drop(proactor);
     assert_eq!(drops.get(), 1);
     assert!(started.elapsed() < Duration::from_secs(3));
+    Ok(())
+}
+
+struct ShutdownPanicker {
+    custom_payload: bool,
+}
+
+struct DropPanickingPayload;
+
+impl Drop for DropPanickingPayload {
+    fn drop(&mut self) {
+        panic!("panic payload destructor");
+    }
+}
+
+impl SubsystemHandler for ShutdownPanicker {
+    fn on_completion(&mut self, _: Completion, _: &mut SubmissionContext<'_>) -> Result<()> {
+        if self.custom_payload {
+            std::panic::panic_any(DropPanickingPayload);
+        }
+        panic!("shutdown handler panic");
+    }
+}
+
+struct RetainedReadOwner {
+    fd: ManuallyDrop<OwnedFd>,
+    buffer: ManuallyDrop<Box<[u8; 1]>>,
+    drops: Rc<Cell<usize>>,
+}
+
+impl SubsystemHandler for RetainedReadOwner {
+    fn on_completion(&mut self, _: Completion, _: &mut SubmissionContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for RetainedReadOwner {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+fn assert_shutdown_panic_retains_resources(custom_payload: bool, outer_panic: bool) -> TestResult {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors has two writable slots and CLOEXEC is a valid pipe flag.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: Each fresh pipe descriptor is adopted exactly once.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: The second pipe descriptor is distinct and has not been adopted.
+    let _write_fd = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    let drops = Rc::new(Cell::new(0));
+    // Retain DMA storage even if a broken teardown destroys the owner early.
+    let mut owner = RetainedReadOwner {
+        fd: ManuallyDrop::new(read_fd),
+        buffer: ManuallyDrop::new(Box::new([0])),
+        drops: Rc::clone(&drops),
+    };
+    let read_fd = owner.fd.as_raw_fd();
+    let buffer = owner.buffer.as_mut_ptr();
+    let mut settings = config(false);
+    settings.enable_optimizations = false;
+    let mut proactor = Proactor::new(settings)?;
+    // SAFETY: ring_mut returns the live exclusively borrowed ring; read only its fd.
+    let ring_fd = unsafe { (*proactor.ring_mut()).ring_fd };
+    proactor.register_subsystem(SubsystemId(1), ShutdownPanicker { custom_payload })?;
+    proactor.register_subsystem(SubsystemId(2), owner)?;
+    proactor.alloc_sqe(op(1, 1))?;
+    proactor.prepare_sqe_with(op(2, 1), |sqe| {
+        // SAFETY: The handler owns a stable one-byte allocation and live descriptor.
+        // ManuallyDrop also protects them if teardown releases the handler early.
+        unsafe { liburing_sys::uring_shim_prep_read(sqe, read_fd, buffer.cast(), 1, 0) };
+    })?;
+    proactor.submit()?;
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let proactor = proactor;
+        if outer_panic {
+            panic!("outer unwind");
+        }
+        drop(proactor);
+    }));
+    assert_eq!(
+        outcome.is_err(),
+        outer_panic,
+        "Drop propagated handler panic"
+    );
+    assert_eq!(drops.get(), 0, "pending handler storage was released");
+    // SAFETY: F_GETFD queries descriptor validity without accessing ring storage.
+    let status = unsafe { libc::fcntl(ring_fd, libc::F_GETFD) };
+    let error = std::io::Error::last_os_error();
+    assert_eq!(status, -1, "ring descriptor remained open");
+    assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    Ok(())
+}
+
+#[test]
+fn integration_lifecycle_scenario_drop_contains_shutdown_handler_panics() -> TestResult {
+    const CHILD: &str = "LIBURING_SHUTDOWN_PANIC_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // A dedicated test process prevents parallel tests from reusing ring_fd.
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "integration_lifecycle_scenario_drop_contains_shutdown_handler_panics",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "shutdown panic child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
+    for custom_payload in [false, true] {
+        for outer_panic in [false, true] {
+            assert_shutdown_panic_retains_resources(custom_payload, outer_panic)?;
+        }
+    }
     Ok(())
 }
 

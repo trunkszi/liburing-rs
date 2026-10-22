@@ -30,7 +30,8 @@ const INTERNAL_CANCEL: u64 = 2;
 /// completion callback is active. Raw SQE resources remain the submitter's
 /// responsibility until their final completion or successful ring shutdown.
 ///
-/// Drop attempts bounded cancellation and draining. If draining fails, it
+/// Drop attempts bounded cancellation and draining. If draining fails or a
+/// completion handler panics, it contains the handler panic and
 /// preserves registered handlers rather than releasing potentially referenced
 /// resources. Call [`Self::shutdown`] explicitly to observe shutdown failures.
 pub struct Proactor {
@@ -635,16 +636,23 @@ impl Proactor {
 
 impl Drop for Proactor {
     fn drop(&mut self) {
-        if self.shutdown().is_err() {
-            // Failed cancellation cannot prove that handler-owned resources are
-            // no longer referenced by the kernel. Preserve that storage.
-            std::mem::forget(std::mem::take(&mut self.registry));
-            if !self.ring_closed {
-                // SAFETY: This ring was initialized and has not yet been closed.
-                // Closing stops further submissions; it is not a DMA drain proof.
-                unsafe { sys::uring_shim_queue_exit(self.ring.as_mut()) };
-                self.ring_closed = true;
+        match catch_unwind(AssertUnwindSafe(|| self.shutdown())) {
+            Ok(Ok(())) => return,
+            Ok(Err(_)) => {}
+            Err(payload) => {
+                // A custom panic payload can itself panic on destruction,
+                // including while Drop is already running during an unwind.
+                std::mem::forget(payload);
             }
+        }
+        // Failed cancellation cannot prove that handler-owned resources are
+        // no longer referenced by the kernel. Preserve that storage.
+        std::mem::forget(std::mem::take(&mut self.registry));
+        if !self.ring_closed {
+            // SAFETY: This ring was initialized and has not yet been closed.
+            // Closing stops further submissions; it is not a DMA drain proof.
+            unsafe { sys::uring_shim_queue_exit(self.ring.as_mut()) };
+            self.ring_closed = true;
         }
     }
 }

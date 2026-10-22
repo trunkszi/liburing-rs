@@ -717,3 +717,82 @@ fn fixed_file_growth_preserves_slot_io_after_original_fd_reuse()
     files.unregister()?;
     Ok(())
 }
+
+#[test]
+fn integration_lifecycle_scenario_mixed_epoch_depleted_receives_both_rearm()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ring = KernelRing::new()?;
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    receiver.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    sender.connect(receiver.local_addr()?)?;
+    // SAFETY: The stable ring and socket outlive this exclusive group; early
+    // failure retains storage, and successful teardown drains all operations.
+    let mut group =
+        ManuallyDrop::new(unsafe { ProvidedBufRing::new(ring.pointer(), 2, 8, BufGroupId(11))? });
+    let sqe = ring.sqe(51);
+    // SAFETY: Socket and group remain live through the receive's final CQE.
+    unsafe { net::prep_recv_multishot(sqe, receiver.as_raw_fd(), group.group_id(), 0) };
+    ring.submit()?;
+    let mut leases = Vec::new();
+    for _ in 0..2 {
+        sender.send(b"held")?;
+        let cqe = ring.completion()?;
+        assert_eq!((cqe.id, cqe.result), (51, 4));
+        // SAFETY: Each distinct, unconsumed CQE transfers its selected buffer.
+        leases.push(unsafe { group.lease_from_cqe(cqe.flags, cqe.result)? });
+    }
+    sender.send(b"trigger")?;
+    let first = ring.completion()?;
+    let sqe = ring.sqe(52);
+    // SAFETY: The socket and exhausted group remain live through completion.
+    unsafe { net::prep_recv_multishot(sqe, receiver.as_raw_fd(), group.group_id(), 0) };
+    ring.submit()?;
+    let second = ring.completion()?;
+    for (cqe, id) in [(&first, 51), (&second, 52)] {
+        assert_eq!((cqe.id, cqe.result), (id, -libc::ENOBUFS));
+        assert_eq!(cqe.flags & liburing_sys::IORING_CQE_F_MORE, 0);
+    }
+    group.mark_depleted_recv(receiver.as_raw_fd(), 0, OpId::from_raw(51))?;
+    drop(leases);
+    assert_eq!(group.returned_count(), 2);
+    group.mark_depleted_recv(receiver.as_raw_fd(), 0, OpId::from_raw(52))?;
+    assert_eq!(receiver.recv(&mut [0; 8])?, 7);
+    let mut staged = Vec::new();
+    assert_eq!(
+        group.rearm_depleted_recvs(|fd, flags, op_id, buffer_group| {
+            staged.push(op_id.raw());
+            let sqe = ring.sqe(op_id.raw());
+            // SAFETY: Both previous receives ended; socket and group remain live.
+            unsafe { net::prep_recv_multishot(sqe, fd, buffer_group, flags) };
+            Ok(())
+        })?,
+        2
+    );
+    assert_eq!(staged, [51, 52]);
+    assert_eq!(
+        group.rearm_depleted_recvs(|_, _, _, _| panic!("duplicate rearm"))?,
+        0
+    );
+    ring.submit()?;
+    for id in [51, 52] {
+        let sqe = ring.sqe(id + 100);
+        // SAFETY: Each ID names one live receive; group storage remains retained.
+        unsafe { net::prep_cancel(sqe, OpId::from_raw(id), 0) };
+        ring.submit()?;
+        let mut completions = [ring.completion()?, ring.completion()?];
+        completions.sort_unstable_by_key(|cqe| cqe.id);
+        assert_eq!(
+            (completions[0].id, completions[0].result),
+            (id, -libc::ECANCELED)
+        );
+        assert_eq!((completions[1].id, completions[1].result), (id + 100, 0));
+        assert_eq!(completions[0].flags & liburing_sys::IORING_CQE_F_MORE, 0);
+    }
+    // SAFETY: Both targets delivered final CQEs, and every lease was returned.
+    unsafe {
+        group.unregister()?;
+        ManuallyDrop::drop(&mut group);
+    }
+    Ok(())
+}
