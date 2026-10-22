@@ -334,10 +334,16 @@ fn main() -> ExampleResult {
         bridge.set_interest(fd, SocketInterest::READABLE)?;
     }
     driver.flush(&mut proactor)?;
+    let removal_start = driver.events.len();
     for &fd in &clients {
         bridge.set_interest(fd, SocketInterest::EMPTY)?;
     }
-    while driver.count(BridgeOpKind::PollRemove) < CLIENTS {
+    while driver.events[removal_start..]
+        .iter()
+        .filter(|event| event.kind == BridgeOpKind::PollRemove)
+        .count()
+        < CLIENTS
+    {
         driver.batch(&mut proactor, &mut bridge)?;
     }
     for &fd in &clients {
