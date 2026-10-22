@@ -279,13 +279,20 @@ fn configure(source: &Path, output: &Path, compiler: &cc::Tool) -> BuildResult<P
     Ok(build)
 }
 
+fn header_directories(source: &Path, build: &Path, manifest: &Path) -> [PathBuf; 5] {
+    [
+        build.join("src/include"),
+        source.join("src/include"),
+        source.join("src"),
+        build.to_path_buf(),
+        manifest.join("csrc"),
+    ]
+}
+
 fn compile_library(source: &Path, build: &Path, manifest: &Path) -> BuildResult<()> {
     let mut native = cc::Build::new();
     native
-        .include(build.join("src/include"))
-        .include(source.join("src/include"))
-        .include(source.join("src"))
-        .include(build)
+        .includes(header_directories(source, build, manifest))
         .define("_GNU_SOURCE", None)
         .define("_LARGEFILE_SOURCE", None)
         .define("_FILE_OFFSET_BITS", "64")
@@ -331,11 +338,14 @@ fn generate_bindings(
                 .ok_or_else(|| failure("compiler flags contain a non-UTF-8 argument"))
         })
         .collect::<BuildResult<Vec<_>>>()?;
+    // Environment include flags must not select different headers for the bindings and archive.
+    let selected_headers = header_directories(source, build, manifest)
+        .into_iter()
+        .map(|path| format!("-I{}", path.display()));
     let bindings = bindgen::Builder::default()
         .header(path_text(&manifest.join("csrc/uring_shim.h"))?)
+        .clang_args(selected_headers)
         .clang_args(compiler_flags)
-        .clang_arg(format!("-I{}", build.join("src/include").display()))
-        .clang_arg(format!("-I{}", source.join("src/include").display()))
         .clang_arg("-include")
         .clang_arg(path_text(&build.join("config-host.h"))?)
         .clang_arg("-D_GNU_SOURCE")

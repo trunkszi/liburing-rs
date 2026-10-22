@@ -5,7 +5,7 @@
 
 use proc_macro2::{Literal, TokenStream};
 use quote::quote;
-use syn::{AttrStyle, Attribute, Expr, Fields, ItemEnum, Lit, LitInt, Variant};
+use syn::{AttrStyle, Attribute, Expr, Fields, ItemEnum, Lit, LitInt, Variant, ext::IdentExt};
 
 /// One accepted unit variant, in source order.
 struct DeclaredVariant {
@@ -31,6 +31,7 @@ struct DeclaredVariant {
 /// - the enum has no variants;
 /// - the enum or a variant already has a `derive` or `repr` attribute;
 /// - the enum or a variant has a `cfg` or `cfg_attr` attribute;
+/// - a variant name conflicts with a generated routing helper or conversion;
 /// - a variant has fields;
 /// - a variant has no discriminant, or the discriminant is not an integer literal (parentheses and
 ///   invisible groups around a single literal are accepted; arithmetic is not);
@@ -208,7 +209,7 @@ fn collect_variants(item: &ItemEnum) -> syn::Result<Vec<DeclaredVariant>> {
 ///
 /// # Errors
 ///
-/// Returns a spanned error for fields, an unsupported attribute, a missing
+/// Returns a spanned error for a reserved name, fields, an unsupported attribute, a missing
 /// or non-literal discriminant, id `0`, an id outside `1..=255`, or a
 /// duplicate id. Duplicate errors span this later variant.
 ///
@@ -220,6 +221,16 @@ fn declare_variant(
     declared: &[DeclaredVariant],
 ) -> syn::Result<DeclaredVariant> {
     reject_input_attributes(&variant.attrs)?;
+    let name = variant.ident.unraw().to_string();
+    if matches!(
+        name.as_str(),
+        "ALL" | "id" | "from_id" | "register_all" | "try_from"
+    ) {
+        return Err(syn::Error::new_spanned(
+            &variant.ident,
+            format!("subsystem variant `{name}` conflicts with a generated routing item"),
+        ));
+    }
     if !matches!(variant.fields, Fields::Unit) {
         return Err(syn::Error::new_spanned(
             variant,
@@ -326,6 +337,15 @@ fn render(item: &ItemEnum, declared: &[DeclaredVariant]) -> TokenStream {
     let (outer_attrs, inner_attrs) = split_attrs(&item.attrs);
     let vis = &item.vis;
     let name = &item.ident;
+    let id_param = syn::Ident::new("__uring_subsystem_id", proc_macro2::Span::mixed_site());
+    let register_param = syn::Ident::new(
+        "__uring_subsystem_register",
+        proc_macro2::Span::mixed_site(),
+    );
+    let error_binding = syn::Ident::new("__uring_subsystem_error", proc_macro2::Span::mixed_site());
+    let value_binding = syn::Ident::new("__uring_subsystem_value", proc_macro2::Span::mixed_site());
+    let widened_binding =
+        syn::Ident::new("__uring_subsystem_widened", proc_macro2::Span::mixed_site());
     let variant_tokens = declared.iter().map(|variant| &variant.tokens);
     let all_entries = declared.iter().map(|variant| {
         let ident = &variant.ident;
@@ -335,17 +355,16 @@ fn render(item: &ItemEnum, declared: &[DeclaredVariant]) -> TokenStream {
         let ident = &variant.ident;
         let id_literal = &variant.id_literal;
         quote! {
-            #id_literal => core::option::Option::Some(Self::#ident),
+            #id_literal => ::core::option::Option::Some(Self::#ident),
         }
     });
-    // `?` needs `core::ops::Try` in scope. Spell the early return out so the
-    // expansion does not depend on the caller prelude.
+    // Spell the early return out without relying on the caller's prelude.
     let register_steps = declared.iter().map(|variant| {
         let ident = &variant.ident;
         quote! {
-            match register(Self::#ident) {
-                core::result::Result::Ok(()) => {}
-                core::result::Result::Err(error) => return core::result::Result::Err(error),
+            match #register_param(Self::#ident) {
+                ::core::result::Result::Ok(()) => {}
+                ::core::result::Result::Err(#error_binding) => return ::core::result::Result::Err(#error_binding),
             }
         }
     });
@@ -355,104 +374,115 @@ fn render(item: &ItemEnum, declared: &[DeclaredVariant]) -> TokenStream {
         quote! {
             {
                 let _: [(); 1] = [(); routing_id_in_range(#id_literal)];
-                let _: [(); 1] = [(); routing_id_in_range(#name::#ident as u8)];
+                let _: [(); 1] = [(); routing_id_in_range(#name::#ident as ::core::primitive::u8)];
             }
         }
     });
 
     quote! {
         #(#outer_attrs)*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[derive(
+            ::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug,
+            ::core::cmp::PartialEq, ::core::cmp::Eq, ::core::hash::Hash,
+        )]
         #[repr(u8)]
         #vis enum #name {
             #(#inner_attrs)*
             #(#variant_tokens)*
         }
 
-        /// Routing helpers for every declared subsystem.
-        impl #name {
-            /// Every declared subsystem, in source order.
-            pub const ALL: &'static [Self] = &[#(#all_entries),*];
-
-            /// Routing byte in 1..=255.
-            ///
-            /// # Panics
-            ///
-            /// This function does not panic.
-            pub const fn id(self) -> u8 {
-                self as u8
-            }
-
-            /// Inverse of id. Returns None for 0 and for any undeclared id.
-            ///
-            /// # Panics
-            ///
-            /// This function does not panic.
-            pub const fn from_id(id: u8) -> core::option::Option<Self> {
-                match id {
-                    #(#from_arms)*
-                    _ => core::option::Option::None,
-                }
-            }
-
-            /// Call register once per declared subsystem, in source order.
-            ///
-            /// Stops at the first error. Earlier callbacks are not rolled back.
-            ///
-            /// # Errors
-            ///
-            /// Returns the first error produced by register.
-            ///
-            /// # Panics
-            ///
-            /// Panics only if register panics.
-            pub fn register_all<E>(
-                mut register: impl FnMut(Self) -> core::result::Result<(), E>,
-            ) -> core::result::Result<(), E> {
-                #(#register_steps)*
-                core::result::Result::Ok(())
-            }
-        }
-
-        /// Converts a subsystem into its routing byte.
-        impl core::convert::From<#name> for u8 {
-            /// Converts a subsystem into its routing byte in `1..=255`.
-            ///
-            /// # Panics
-            ///
-            /// This function does not panic.
-            fn from(value: #name) -> u8 {
-                value.id()
-            }
-        }
-
-        /// Converts a routing byte into a declared subsystem.
-        impl core::convert::TryFrom<u8> for #name {
-            /// Byte that is `0` or not a declared subsystem.
-            type Error = u8;
-
-            /// Converts a routing byte into a subsystem.
-            ///
-            /// # Errors
-            ///
-            /// Returns `Err(id)` when `id` is `0` or is not a declared subsystem.
-            ///
-            /// # Panics
-            ///
-            /// This function does not panic.
-            fn try_from(id: u8) -> core::result::Result<Self, u8> {
-                match Self::from_id(id) {
-                    core::option::Option::Some(value) => core::result::Result::Ok(value),
-                    core::option::Option::None => core::result::Result::Err(id),
-                }
-            }
-        }
-
-        // Each declared subsystem id must sit in 1..=255.
         const _: () = {
-            const fn routing_id_in_range(id: u8) -> usize {
-                let widened: u16 = id as u16;
-                ((widened >= 1) && (widened <= 255)) as usize
+            // Function items keep outer constants out of generated binding patterns.
+            fn #id_param() {}
+            fn #register_param() {}
+            fn #error_binding() {}
+            fn #value_binding() {}
+            fn #widened_binding() {}
+            let _ = (#id_param, #register_param, #error_binding, #value_binding, #widened_binding);
+
+            /// Routing helpers for every declared subsystem.
+            impl #name {
+                /// Every declared subsystem, in source order.
+                pub const ALL: &'static [Self] = &[#(#all_entries),*];
+
+                /// Routing byte in 1..=255.
+                ///
+                /// # Panics
+                ///
+                /// This function does not panic.
+                pub const fn id(self) -> ::core::primitive::u8 {
+                    self as ::core::primitive::u8
+                }
+
+                /// Inverse of id. Returns None for 0 and for any undeclared id.
+                ///
+                /// # Panics
+                ///
+                /// This function does not panic.
+                pub const fn from_id(#id_param: ::core::primitive::u8) -> ::core::option::Option<Self> {
+                    match #id_param {
+                        #(#from_arms)*
+                        _ => ::core::option::Option::None,
+                    }
+                }
+
+                /// Call register once per declared subsystem, in source order.
+                ///
+                /// Stops at the first error. Earlier callbacks are not rolled back.
+                ///
+                /// # Errors
+                ///
+                /// Returns the first error produced by register.
+                ///
+                /// # Panics
+                ///
+                /// Panics only if register panics.
+                pub fn register_all<E>(
+                    mut #register_param: impl ::core::ops::FnMut(Self) -> ::core::result::Result<(), E>,
+                ) -> ::core::result::Result<(), E> {
+                    #(#register_steps)*
+                    ::core::result::Result::Ok(())
+                }
+            }
+
+            /// Converts a subsystem into its routing byte.
+            impl ::core::convert::From<#name> for ::core::primitive::u8 {
+                /// Converts a subsystem into its routing byte in `1..=255`.
+                ///
+                /// # Panics
+                ///
+                /// This function does not panic.
+                fn from(#value_binding: #name) -> ::core::primitive::u8 {
+                    #value_binding.id()
+                }
+            }
+
+            /// Converts a routing byte into a declared subsystem.
+            impl ::core::convert::TryFrom<::core::primitive::u8> for #name {
+                /// Byte that is `0` or not a declared subsystem.
+                type Error = ::core::primitive::u8;
+
+                /// Converts a routing byte into a subsystem.
+                ///
+                /// # Errors
+                ///
+                /// Returns `Err(id)` when `id` is `0` or is not a declared subsystem.
+                ///
+                /// # Panics
+                ///
+                /// This function does not panic.
+                fn try_from(#id_param: ::core::primitive::u8) -> ::core::result::Result<Self, ::core::primitive::u8> {
+                    match Self::from_id(#id_param) {
+                        ::core::option::Option::Some(#value_binding) => ::core::result::Result::Ok(#value_binding),
+                        ::core::option::Option::None => ::core::result::Result::Err(#id_param),
+                    }
+                }
+            }
+
+            // Each declared subsystem id must sit in 1..=255.
+            const fn routing_id_in_range(#id_param: ::core::primitive::u8) -> ::core::primitive::usize {
+                let #widened_binding: ::core::primitive::u16 = #id_param as ::core::primitive::u16;
+                ((#widened_binding >= 1) && (#widened_binding <= 255)) as ::core::primitive::usize
             }
             #(#assert_ids)*
         };
@@ -462,6 +492,40 @@ fn render(item: &ItemEnum, declared: &[DeclaredVariant]) -> TokenStream {
 #[cfg(test)]
 mod unit_tests {
     use quote::quote;
+
+    #[test]
+    fn unit_scenario_generated_routing_names_are_rejected_with_diagnostics() {
+        for name in ["ALL", "id", "from_id", "register_all", "try_from"] {
+            for spelling in [name.to_owned(), format!("r#{name}")] {
+                let input = format!("enum Subsystems {{ {spelling} = 1 }}")
+                    .parse::<proc_macro2::TokenStream>();
+                let input = match input {
+                    Ok(input) => input,
+                    Err(error) => panic!("invalid test declaration: {error}"),
+                };
+                let error = match super::expand(input) {
+                    Ok(_) => panic!("reserved routing name was accepted: {spelling}"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!("subsystem variant `{name}` conflicts with a generated routing item")
+                );
+                assert!(
+                    error
+                        .to_compile_error()
+                        .to_string()
+                        .contains("compile_error")
+                );
+            }
+        }
+        assert!(
+            super::expand(quote! {
+                enum Subsystems { All = 1, FromId = 2, id_next = 3, r#Network = 4 }
+            })
+            .is_ok()
+        );
+    }
 
     #[test]
     fn conditional_attributes_are_rejected_on_enums_and_variants() {

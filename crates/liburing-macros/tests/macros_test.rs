@@ -344,3 +344,92 @@ fn subsystem_ids_roundtrip_and_register_in_order() {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Stop;
+
+mod subsystem_caller_hygiene {
+    use super::define_subsystems;
+
+    #[allow(non_camel_case_types)]
+    type u8 = i8;
+    #[allow(non_camel_case_types)]
+    type u16 = i8;
+    #[allow(non_camel_case_types)]
+    type usize = i8;
+
+    mod core {
+        pub const CALL_SITE: () = ();
+    }
+
+    trait FnMut {}
+    impl FnMut for () {}
+    fn uses_local_trait<T: FnMut>(_: T) {}
+
+    #[allow(non_upper_case_globals)]
+    const register: u8 = 1;
+    #[allow(non_upper_case_globals)]
+    const id: u8 = 2;
+    #[allow(non_upper_case_globals)]
+    const value: u8 = 3;
+    #[allow(non_upper_case_globals)]
+    const error: u8 = 4;
+    #[allow(non_upper_case_globals)]
+    const widened: u8 = 5;
+    #[allow(non_upper_case_globals)]
+    const routing_id_in_range: u8 = 6;
+    #[allow(non_upper_case_globals)]
+    const __uring_subsystem_id: u8 = 7;
+    #[allow(non_upper_case_globals)]
+    const __uring_subsystem_register: u8 = 8;
+    #[allow(non_upper_case_globals)]
+    const __uring_subsystem_error: u8 = 9;
+    #[allow(non_upper_case_globals)]
+    const __uring_subsystem_value: u8 = 10;
+    #[allow(non_upper_case_globals)]
+    const __uring_subsystem_widened: u8 = 11;
+
+    define_subsystems! {
+        enum Routes { Low = 1, Wide = 200 }
+    }
+
+    #[test]
+    fn unit_scenario_subsystem_helpers_ignore_caller_bindings() {
+        let _: u16 = 7;
+        let _: usize = 8;
+        let () = core::CALL_SITE;
+        uses_local_trait(());
+        assert_eq!(
+            (register, id, value, error, widened, routing_id_in_range),
+            (1, 2, 3, 4, 5, 6)
+        );
+        assert_eq!(
+            (
+                __uring_subsystem_id,
+                __uring_subsystem_register,
+                __uring_subsystem_error,
+                __uring_subsystem_value,
+                __uring_subsystem_widened,
+            ),
+            (7, 8, 9, 10, 11)
+        );
+        assert_eq!(Routes::Wide.id(), 200_u8);
+        assert_eq!(Routes::from_id(200), Some(Routes::Wide));
+        assert_eq!(Routes::from_id(0), None);
+        assert_eq!(Routes::try_from(200_u8), Ok(Routes::Wide));
+        assert_eq!(Routes::try_from(0_u8), Err(0_u8));
+        assert_eq!(::core::primitive::u8::from(Routes::Wide), 200_u8);
+        assert_eq!(Routes::ALL, &[Routes::Low, Routes::Wide]);
+        let mut seen = Vec::new();
+        let registered = Routes::register_all(|subsystem| {
+            seen.push(subsystem.id());
+            Ok::<(), ()>(())
+        });
+        assert_eq!(registered, Ok(()));
+        assert_eq!(seen, [1_u8, 200_u8]);
+        seen.clear();
+        let stopped = Routes::register_all(|subsystem| {
+            seen.push(subsystem.id());
+            Err::<(), _>(subsystem.id())
+        });
+        assert_eq!(stopped, Err(1_u8));
+        assert_eq!(seen, [1_u8]);
+    }
+}
