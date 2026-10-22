@@ -15,7 +15,7 @@ The ring stays on its creating thread. Completion callbacks receive a bounded
 | Layer | Crate | Responsibility |
 | --- | --- | --- |
 | Native boundary | `liburing-sys` | Build upstream C liburing and an inline-helper shim into a static archive; expose raw C bindings. |
-| Compile-time integration | `liburing-macros` | Subsystem payload encoding and generated integration helpers. |
+| Compile-time integration | `liburing-macros` | `OpPayloadCodec` derive and validated subsystem IDs through `define_subsystems!`. |
 | Runtime | `liburing` | Thread-local proactor, staged SQEs, completion routing, buffer and descriptor helpers, wakeups, and socket bridge. |
 
 The workspace uses Rust 2024 and the toolchain selected by

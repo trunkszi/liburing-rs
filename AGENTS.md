@@ -11,7 +11,7 @@ This Linux, Rust 2024 workspace has three layers:
 | Crate | Responsibility |
 | --- | --- |
 | `crates/liburing-sys` | Upstream static C build, inline-helper shim, generated bindings, and ABI checks. |
-| `crates/liburing-macros` | Compile-time payload encoding and integration helpers. |
+| `crates/liburing-macros` | `OpPayloadCodec` derive and validated subsystem IDs through `define_subsystems!`. |
 | `crates/liburing` | Ring ownership, staged submissions, completion routing, DMA and descriptor helpers, wakeups, and socket bridge. |
 
 Keep native ABI changes in `liburing-sys`, syntax generation in
