@@ -600,22 +600,120 @@ fn integration_lifecycle_scenario_fixed_file_boundaries_preserve_free_slots()
     }
     assert_eq!(files.insert(raw)?, liburing::UringFileSlot(0));
     assert_eq!(files.insert(raw)?, liburing::UringFileSlot(2));
-    assert!(matches!(
-        files.insert(raw),
-        Err(liburing::UringError::FixedFileSlotsExhausted)
-    ));
+    assert_eq!(files.insert(raw)?, liburing::UringFileSlot(3));
+    assert_eq!(files.capacity(), 6);
+    for index in 0..4 {
+        assert_eq!(files.get(liburing::UringFileSlot(index)), Some(raw));
+    }
     let middle = liburing::UringFileSlot(1);
     assert_eq!(files.remove(middle)?, raw);
     assert!(matches!(
         files.remove(middle),
         Err(liburing::UringError::InvalidFileSlot(1))
     ));
-    assert_eq!(files.available(), 1);
+    assert_eq!(files.available(), 3);
     assert_eq!(files.insert(raw)?, middle);
     files.unregister()?;
     files.unregister()?;
     assert!(files.insert(raw).is_err());
     assert!(files.remove(middle).is_err());
     assert_eq!((files.len(), files.available()), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn fixed_file_growth_preserves_slot_io_after_original_fd_reuse()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ring = KernelRing::new()?;
+    let original = anonymous_file()?;
+    let second = anonymous_file()?;
+    original.write_all_at(b"original", 0)?;
+    second.write_all_at(b"second!!", 0)?;
+    // SAFETY: This test exclusively owns registration and the stable ring
+    // outlives the table. Both descriptors are live during construction.
+    let mut files = unsafe { FixedFileTable::register(ring.pointer(), &[original.as_raw_fd()])? };
+    let first_slot = liburing::UringFileSlot(0);
+    let original_fd = original.as_raw_fd();
+    // SAFETY: Both descriptors are owned here. Replacing our original descriptor
+    // cannot close another owner's fd; the table must retain its own file ref.
+    let replaced = unsafe { libc::dup2(second.as_raw_fd(), original_fd) };
+    assert_eq!(replaced, original_fd);
+    drop(original);
+    let second_slot = files.insert(second.as_raw_fd())?;
+    assert_eq!(
+        (first_slot.raw(), second_slot.raw(), files.capacity()),
+        (0, 1, 2)
+    );
+    assert_eq!(files.get(first_slot), Some(original_fd));
+    assert_eq!(files.get(second_slot), Some(second.as_raw_fd()));
+    files.grow(7)?;
+    assert_eq!(files.capacity(), 7);
+    files.grow(1)?;
+    assert_eq!(files.capacity(), 7);
+    assert!(files.grow(u32::MAX).is_err());
+    assert_eq!(files.capacity(), 7);
+    for (slot, expected) in [(first_slot, b"original"), (second_slot, b"second!!")] {
+        let mut bytes = [0_u8; 8];
+        let sqe = ring.sqe(100 + u64::from(slot.raw()));
+        // SAFETY: Both stable slot indices remain registered. The writable
+        // stack buffer stays alive and unaccessed until the read's final CQE.
+        unsafe {
+            liburing_sys::uring_shim_prep_read(
+                sqe,
+                slot.raw() as i32,
+                bytes.as_mut_ptr().cast(),
+                8,
+                0,
+            );
+            liburing_sys::uring_shim_sqe_set_flags(
+                sqe,
+                1_u32 << liburing_sys::IOSQE_FIXED_FILE_BIT,
+            );
+        }
+        ring.submit()?;
+        assert_eq!(ring.completion()?.result, 8);
+        assert_eq!(&bytes, expected);
+        let update = b"updated!";
+        let sqe = ring.sqe(200 + u64::from(slot.raw()));
+        // SAFETY: The slot remains registered and update's immutable storage
+        // remains alive until the write's own final completion below.
+        unsafe {
+            liburing_sys::uring_shim_prep_write(
+                sqe,
+                slot.raw() as i32,
+                update.as_ptr().cast(),
+                8,
+                0,
+            );
+            liburing_sys::uring_shim_sqe_set_flags(
+                sqe,
+                1_u32 << liburing_sys::IOSQE_FIXED_FILE_BIT,
+            );
+        }
+        ring.submit()?;
+        assert_eq!(ring.completion()?.result, 8);
+        let sqe = ring.sqe(300 + u64::from(slot.raw()));
+        // SAFETY: The same registered slot and stack buffer remain valid until
+        // this read's final CQE, after the preceding write completed.
+        unsafe {
+            liburing_sys::uring_shim_prep_read(
+                sqe,
+                slot.raw() as i32,
+                bytes.as_mut_ptr().cast(),
+                8,
+                0,
+            );
+            liburing_sys::uring_shim_sqe_set_flags(
+                sqe,
+                1_u32 << liburing_sys::IOSQE_FIXED_FILE_BIT,
+            );
+        }
+        ring.submit()?;
+        assert_eq!(ring.completion()?.result, 8);
+        assert_eq!(&bytes, update);
+    }
+    assert_eq!(files.remove(first_slot)?, original_fd);
+    assert_eq!(files.insert(second.as_raw_fd())?, first_slot);
+    files.unregister()?;
     Ok(())
 }

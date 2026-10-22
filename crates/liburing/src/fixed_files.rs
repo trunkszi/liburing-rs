@@ -4,7 +4,12 @@
 //! must not be reused until all operations that refer to its previous file have
 //! completed. Direct-close completion is an explicit, unsafe reclamation seam.
 
-use std::{marker::PhantomData, os::fd::RawFd, ptr::NonNull, rc::Rc};
+use std::{
+    marker::PhantomData,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    ptr::NonNull,
+    rc::Rc,
+};
 
 use crate::{
     error::{Result, UringError},
@@ -15,15 +20,18 @@ const EINVAL: i32 = 22;
 const EBADF: i32 = 9;
 const EIO: i32 = 5;
 
-/// A bounded registered-file table with an allocation-free free-slot stack.
+/// A dynamically growing registered-file table with a free-slot stack.
 ///
 /// Registering a descriptor retains a kernel file reference and leaves ownership
 /// of the original descriptor with the caller. This type is neither `Send` nor
 /// `Sync`. Call [`Self::unregister`] to observe teardown errors explicitly;
-/// dropping the table attempts to unregister any remaining registration.
+/// dropping the table attempts to unregister any remaining registration. Each
+/// occupied slot retains a private close-on-exec duplicate so growth preserves
+/// file identity when a caller closes or reuses its original descriptor.
 pub struct FixedFileTable {
     ring: NonNull<liburing_sys::io_uring>,
     entries: Vec<Option<RawFd>>,
+    retained: Vec<Option<OwnedFd>>,
     free: Vec<u32>,
     registered: bool,
     single_thread: PhantomData<Rc<()>>,
@@ -52,6 +60,9 @@ impl FixedFileTable {
         }
         let entries = vec![None; capacity as usize];
         let free = (0..capacity).rev().collect();
+        let retained = std::iter::repeat_with(|| None)
+            .take(capacity as usize)
+            .collect();
         // SAFETY: The caller guarantees a live, exclusively managed ring; the
         // validated capacity fits the kernel's signed fixed-file index range.
         let result =
@@ -60,6 +71,7 @@ impl FixedFileTable {
         Ok(Self {
             ring,
             entries,
+            retained,
             free,
             registered: true,
             single_thread: PhantomData,
@@ -73,7 +85,8 @@ impl FixedFileTable {
     ///
     /// # Errors
     /// Returns an error for a null ring, empty or oversized input, an invalid
-    /// negative descriptor, or a kernel registration failure.
+    /// negative descriptor, descriptor duplication failure, or a kernel
+    /// registration failure.
     ///
     /// # Panics
     /// Does not panic for invalid arguments. Allocation failure follows the
@@ -88,6 +101,16 @@ impl FixedFileTable {
         if files.is_empty() || files.len() > i32::MAX as usize || files.iter().any(|&fd| fd < -1) {
             return Err(errno(EINVAL));
         }
+        let retained = files
+            .iter()
+            .map(|&fd| {
+                if fd == -1 {
+                    Ok(None)
+                } else {
+                    duplicate(fd).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         let entries = files
             .iter()
             .map(|&fd| if fd == -1 { None } else { Some(fd) })
@@ -112,6 +135,7 @@ impl FixedFileTable {
         Ok(Self {
             ring,
             entries,
+            retained,
             free,
             registered: true,
             single_thread: PhantomData,
@@ -121,11 +145,14 @@ impl FixedFileTable {
     /// Registers `fd` in the next free slot for `IOSQE_FIXED_FILE` operations.
     ///
     /// The returned slot contains a direct index, not an OS descriptor. The
-    /// update and free-stack transition commit only after kernel success.
+    /// update and free-stack transition commit only after kernel success. A full
+    /// table grows automatically; see [`Self::grow`] for growth requirements.
     ///
     /// # Errors
-    /// Returns an error for a negative descriptor, an unregistered or full
-    /// table, or a kernel update failure. Failure leaves the slot available.
+    /// Returns an error for a negative descriptor, an unregistered table,
+    /// descriptor duplication, allocation, growth, or kernel update failure.
+    /// Failure leaves
+    /// the chosen slot available; successful growth can increase capacity.
     ///
     /// # Panics
     /// Does not panic.
@@ -136,15 +163,120 @@ impl FixedFileTable {
         if fd < 0 {
             return Err(errno(EINVAL));
         }
+        let retained = duplicate(fd)?;
+        if self.free.is_empty() {
+            let capacity = self.capacity() as u32;
+            self.grow(
+                capacity
+                    .checked_add(1)
+                    .ok_or(UringError::FixedFileSlotsExhausted)?,
+            )?;
+        }
         let index = self
             .free
             .last()
             .copied()
             .ok_or(UringError::FixedFileSlotsExhausted)?;
-        self.update(index, fd)?;
+        self.update(index, retained.as_raw_fd())?;
+        self.retained[index as usize] = Some(retained);
         self.free.pop();
         self.entries[index as usize] = Some(fd);
         Ok(UringFileSlot(index))
+    }
+
+    /// Expands registration to at least `min_capacity`, preserving slot indices.
+    ///
+    /// Capacity at least doubles and never exceeds `i32::MAX`. Allocation is
+    /// completed before replacing the kernel table. No SQEs may be submitted by
+    /// another owner during replacement; construction already requires exclusive
+    /// registration ownership. A failed replacement attempts to restore the old
+    /// table. Private close-on-exec duplicates preserve each file identity even
+    /// after the caller closes or reuses its original descriptor.
+    /// If restoration fails, the table becomes unregistered, retained references
+    /// are released, and all slot lookups and modifications fail. Run growth on
+    /// the control plane after prior fixed-file I/O retires; kernel
+    /// unregistration can wait for outstanding operations.
+    ///
+    /// # Errors
+    /// Returns an error for an unregistered table, an oversized request,
+    /// allocation failure, or kernel unregistration/replacement failure.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn grow(&mut self, min_capacity: u32) -> Result<()> {
+        let ring = self.ring;
+        self.grow_with(min_capacity, |files| {
+            // SAFETY: Construction guarantees exclusive registration ownership
+            // on a live stable ring. The slice remains valid throughout the
+            // copying syscall; None requests unregistration without a buffer.
+            let result = unsafe {
+                match files {
+                    Some(files) => liburing_sys::uring_shim_register_files(
+                        ring.as_ptr(),
+                        files.as_ptr(),
+                        files.len() as u32,
+                    ),
+                    None => liburing_sys::uring_shim_unregister_files(ring.as_ptr()),
+                }
+            };
+            check_zero(result)
+        })
+    }
+
+    fn grow_with(
+        &mut self,
+        min_capacity: u32,
+        mut register: impl FnMut(Option<&[RawFd]>) -> Result<()>,
+    ) -> Result<()> {
+        if !self.registered {
+            return Err(errno(EBADF));
+        }
+        let old_cap = self.entries.len();
+        if min_capacity <= old_cap as u32 {
+            return Ok(());
+        }
+        if min_capacity > i32::MAX as u32 {
+            return Err(errno(EINVAL));
+        }
+        let new_cap = (old_cap as u32)
+            .max(1)
+            .saturating_mul(2)
+            .max(min_capacity)
+            .min(i32::MAX as u32) as usize;
+        let added = new_cap - old_cap;
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(new_cap)
+            .map_err(|_| errno(libc::ENOMEM))?;
+        self.entries
+            .try_reserve_exact(added)
+            .map_err(|_| errno(libc::ENOMEM))?;
+        self.free
+            .try_reserve_exact(new_cap - self.free.len())
+            .map_err(|_| errno(libc::ENOMEM))?;
+        self.retained
+            .try_reserve_exact(added)
+            .map_err(|_| errno(libc::ENOMEM))?;
+        files.extend(
+            self.retained
+                .iter()
+                .map(|fd| fd.as_ref().map_or(-1, AsRawFd::as_raw_fd)),
+        );
+        files.resize(new_cap, -1);
+        register(None)?;
+        self.registered = false;
+        if let Err(error) = register(Some(&files)) {
+            self.registered = register(Some(&files[..old_cap])).is_ok();
+            if !self.registered {
+                self.retained.clear();
+            }
+            return Err(error);
+        }
+        self.registered = true;
+        self.entries.resize(new_cap, None);
+        self.retained.resize_with(new_cap, || None);
+        self.free.extend((old_cap as u32..new_cap as u32).rev());
+        Ok(())
     }
 
     /// Removes a fixed-file registration and makes its slot available again.
@@ -162,6 +294,7 @@ impl FixedFileTable {
         let fd = self.occupied(slot)?;
         self.update(slot.0, -1)?;
         self.entries[slot.0 as usize] = None;
+        self.retained[slot.0 as usize] = None;
         self.free.push(slot.0);
         Ok(fd)
     }
@@ -187,6 +320,7 @@ impl FixedFileTable {
     pub unsafe fn reclaim_direct_close(&mut self, slot: UringFileSlot) -> Result<RawFd> {
         let fd = self.occupied(slot)?;
         self.entries[slot.0 as usize] = None;
+        self.retained[slot.0 as usize] = None;
         self.free.push(slot.0);
         Ok(fd)
     }
@@ -204,7 +338,7 @@ impl FixedFileTable {
         }
     }
 
-    /// Returns the fixed capacity selected during registration.
+    /// Returns the current number of registered slots, including empty slots.
     ///
     /// # Panics
     /// Does not panic.
@@ -264,6 +398,7 @@ impl FixedFileTable {
         let result = unsafe { liburing_sys::uring_shim_unregister_files(self.ring.as_ptr()) };
         check_zero(result)?;
         self.registered = false;
+        self.retained.clear();
         Ok(())
     }
 
@@ -306,6 +441,159 @@ fn check_zero(result: i32) -> Result<()> {
     }
 }
 
+fn duplicate(fd: RawFd) -> Result<OwnedFd> {
+    // SAFETY: fcntl validates the integer descriptor and returns a new owned fd;
+    // this command has no pointer argument and does not affect caller ownership.
+    let copied = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copied < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: Successful F_DUPFD_CLOEXEC returned a uniquely owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(copied) })
+}
+
 fn errno(code: i32) -> UringError {
     UringError::from_errno(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn null_file() -> OwnedFd {
+        match std::fs::File::open("/dev/null") {
+            Ok(file) => file.into(),
+            Err(error) => panic!("opening /dev/null: {error}"),
+        }
+    }
+
+    struct FakeTable(FixedFileTable);
+
+    impl std::ops::Deref for FakeTable {
+        type Target = FixedFileTable;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for FakeTable {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    impl Drop for FakeTable {
+        fn drop(&mut self) {
+            self.0.registered = false;
+        }
+    }
+
+    fn fake_table() -> FakeTable {
+        FakeTable(FixedFileTable {
+            ring: NonNull::dangling(),
+            entries: vec![Some(10), None, Some(12)],
+            retained: vec![Some(null_file()), None, Some(null_file())],
+            free: vec![1],
+            registered: true,
+            single_thread: PhantomData,
+        })
+    }
+
+    #[test]
+    fn replacement_failure_restores_original_slots() {
+        let mut table = fake_table();
+        let originals: Vec<_> = table
+            .retained
+            .iter()
+            .map(|fd| fd.as_ref().map_or(-1, AsRawFd::as_raw_fd))
+            .collect();
+        let mut expanded = originals.clone();
+        expanded.resize(6, -1);
+        let mut calls = Vec::new();
+        let result = table.grow_with(4, |files| {
+            calls.push(files.map(<[RawFd]>::to_vec));
+            if calls.len() == 2 {
+                Err(errno(EINVAL))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err(errno(EINVAL)));
+        assert!(table.registered);
+        assert_eq!(table.entries, [Some(10), None, Some(12)]);
+        assert_eq!(table.free, [1]);
+        assert_eq!(calls, [None, Some(expanded), Some(originals)]);
+    }
+
+    #[test]
+    fn failed_rollback_invalidates_table() {
+        use std::io::Read;
+        let (retained, mut peer) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("creating socket pair: {error}"),
+        };
+        assert!(peer.set_nonblocking(true).is_ok());
+        let mut table = fake_table();
+        table.retained[0] = Some(retained.into());
+        let mut calls = 0;
+        assert!(
+            table
+                .grow_with(4, |_| {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(())
+                    } else {
+                        Err(errno(EINVAL))
+                    }
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 3);
+        assert!(!table.registered);
+        assert!(matches!(peer.read(&mut [0]), Ok(0)));
+        assert_eq!(table.get(UringFileSlot(0)), None);
+        assert_eq!((table.len(), table.available()), (0, 0));
+        assert!(table.insert(10).is_err());
+        assert!(table.grow(8).is_err());
+    }
+
+    #[test]
+    fn failed_unregister_keeps_registration_and_noop_avoids_syscalls() {
+        let mut table = fake_table();
+        assert!(
+            table
+                .grow_with(4, |files| {
+                    assert!(files.is_none());
+                    Err(errno(libc::EBUSY))
+                })
+                .is_err()
+        );
+        assert!(table.registered);
+        assert_eq!(table.get(UringFileSlot(0)), Some(10));
+        assert_eq!(table.capacity(), 3);
+        assert!(
+            table
+                .grow_with(3, |_| panic!("no-op must not replace table"))
+                .is_ok()
+        );
+        assert!(
+            table
+                .grow_with(u32::MAX, |_| panic!(
+                    "invalid capacity must not replace table"
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn growth_commits_capacity_and_ascending_new_slots() {
+        let mut table = fake_table();
+        assert!(table.grow_with(7, |_| Ok(())).is_ok());
+        assert_eq!(table.capacity(), 7);
+        assert_eq!(table.get(UringFileSlot(0)), Some(10));
+        assert_eq!(table.get(UringFileSlot(2)), Some(12));
+        assert_eq!(table.free, [1, 6, 5, 4, 3]);
+        assert!(table.free.capacity() >= table.capacity());
+    }
 }

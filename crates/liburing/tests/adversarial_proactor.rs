@@ -81,16 +81,9 @@ impl SubsystemHandler for Recorder {
 
 #[test]
 fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -> TestResult {
-    static BYTES: [u8; REENTRANT_OPERATIONS] = {
-        let mut bytes = [0; REENTRANT_OPERATIONS];
-        let mut index = 0;
-        while index < bytes.len() {
-            bytes[index] = index as u8;
-            index += 1;
-        }
-        bytes
-    };
+    static BYTES: [u8; REENTRANT_OPERATIONS] = [0x5a; REENTRANT_OPERATIONS];
     let (read_end, write_end) = blocking_pipe()?;
+    let write_fd = write_end.as_raw_fd();
     let mut proactor = kernel_proactor(false)?;
     let id = route(1);
     let observed = Rc::new(RefCell::new(Vec::new()));
@@ -98,6 +91,7 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
     proactor.alloc_sqe(operation(id, 0))?;
     let started = Instant::now();
     let mut staged = false;
+    let mut checked_fifo = false;
     while observed.borrow().len() < REENTRANT_OPERATIONS + 1 {
         assert_before_deadline(started, "reentrant SQ saturation");
         proactor.wait_completions(1, Some(Duration::from_millis(20)), |completion, context| {
@@ -111,14 +105,7 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
                         // bytes; the pipe stays open through every final CQE.
                         unsafe {
                             let byte = &BYTES[sequence - 1] as *const u8;
-                            sys::uring_shim_prep_write(
-                                sqe,
-                                write_end.as_raw_fd(),
-                                byte.cast(),
-                                1,
-                                0,
-                            );
-                            (*sqe).flags |= sys::IOSQE_IO_DRAIN as u8;
+                            sys::uring_shim_prep_write(sqe, write_fd, byte.cast(), 1, 0);
                         }
                     })?;
                 }
@@ -126,6 +113,19 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
             }
             Ok(())
         })?;
+        if staged && !checked_fifo {
+            // SAFETY: Only this thread owns the live non-SQPOLL ring. Read only
+            // initialized unpublished SQEs; no submission or CQ mutation occurs.
+            let sq = unsafe { &(*proactor.ring_mut()).sq };
+            assert_eq!(sq.sqe_tail.wrapping_sub(sq.sqe_head), SQ_DEPTH);
+            for offset in 0..SQ_DEPTH {
+                let index = sq.sqe_head.wrapping_add(offset) & sq.ring_mask;
+                // SAFETY: The masked index identifies an initialized SQE above.
+                let raw = unsafe { (*sq.sqes.add(index as usize)).user_data };
+                assert_eq!(raw, operation(id, u64::from(offset + 1)).raw());
+            }
+            checked_fifo = true;
+        }
     }
     assert!(staged);
     let completions = observed.borrow();
@@ -135,10 +135,9 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
     for sequence in 0..=REENTRANT_OPERATIONS {
         assert!(unique.contains(&operation(id, sequence as u64).raw()));
     }
-    // DRAIN serializes writes in submission order, independently of CQE order.
     let mut actual = [0; REENTRANT_OPERATIONS];
     std::fs::File::from(read_end).read_exact(&mut actual)?;
-    assert_eq!(actual, BYTES, "staged submissions must preserve FIFO order");
+    assert_eq!(actual, BYTES, "every staged write must complete");
     assert_eq!(
         proactor.tick()?,
         0,
