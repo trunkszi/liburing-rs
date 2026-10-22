@@ -35,6 +35,10 @@ struct DepletedRecv {
 struct DepletedRecvs {
     records: Box<[Cell<Option<DepletedRecv>>]>,
     rearming: Cell<bool>,
+    returned: Cell<u64>,
+    credits: Cell<u64>,
+    query_allowed: Cell<bool>,
+    kernel_credits: Cell<bool>,
 }
 
 struct RearmGuard<'a>(&'a Cell<bool>);
@@ -50,6 +54,10 @@ impl DepletedRecvs {
         Self {
             records: (0..capacity).map(|_| Cell::new(None)).collect(),
             rearming: Cell::new(false),
+            returned: Cell::new(0),
+            credits: Cell::new(0),
+            query_allowed: Cell::new(true),
+            kernel_credits: Cell::new(false),
         }
     }
 
@@ -74,6 +82,12 @@ impl DepletedRecvs {
                 None if vacant.is_none() => vacant = Some(record),
                 _ => {}
             }
+        }
+        if !self.records.iter().any(|record| record.get().is_some()) {
+            self.returned.set(returned);
+            self.credits.set(0);
+            self.query_allowed.set(true);
+            self.kernel_credits.set(false);
         }
         let record = vacant.ok_or(UringError::Syscall {
             op: "mark_depleted_recv",
@@ -106,7 +120,7 @@ impl DepletedRecvs {
         &self,
         returned: u64,
         group: BufGroupId,
-        mut available: impl FnMut() -> Result<bool>,
+        mut available: impl FnMut() -> Result<u64>,
         mut submitter: impl FnMut(RawFd, i32, OpId, BufGroupId) -> Result<()>,
     ) -> Result<usize> {
         if self.rearming.replace(true) {
@@ -119,32 +133,47 @@ impl DepletedRecvs {
                 record.set(Some(pending));
             }
         }
+        let replenished = returned.wrapping_sub(self.returned.replace(returned));
+        self.credits
+            .set(self.credits.get().saturating_add(replenished));
         let mut staged = 0;
-        let mut kernel_available = None;
+        let mut query_error = None;
+        let mut query_attempted = false;
         for record in &self.records {
             if let Some(pending) = record.get() {
                 if pending.deferred {
                     continue;
                 }
-                if pending.returned_at_depletion == returned {
-                    let ready = match kernel_available {
-                        Some(ready) => ready,
-                        None => {
-                            let ready = available()?;
-                            kernel_available = Some(ready);
-                            ready
+                let returned_after_depletion = pending.returned_at_depletion != returned;
+                if (!returned_after_depletion || self.credits.get() == 0)
+                    && self.query_allowed.get()
+                    && !query_attempted
+                {
+                    query_attempted = true;
+                    match available() {
+                        Ok(count) => {
+                            self.credits.set(count);
+                            self.kernel_credits.set(count > 0);
+                            self.query_allowed.set(count == 0);
                         }
-                    };
-                    if !ready {
-                        continue;
+                        Err(error) => query_error = Some(error),
                     }
+                }
+                if self.credits.get() == 0
+                    || (!returned_after_depletion && !self.kernel_credits.get())
+                {
+                    continue;
                 }
                 submitter(pending.fd, pending.flags, pending.op_id, group)?;
                 record.set(None);
+                self.credits.set(self.credits.get() - 1);
+                self.kernel_credits
+                    .set(self.kernel_credits.get() && self.credits.get() > 0);
+                self.query_allowed.set(false);
                 staged += 1;
             }
         }
-        Ok(staged)
+        query_error.map_or(Ok(staged), Err)
     }
 }
 
@@ -303,11 +332,11 @@ impl ProvidedBufRing {
     /// removed; a failing record and all unprocessed records remain pending.
     /// The return value is the number staged during this bounded scan. A callback
     /// may return other leases or park other receives; newly returned buffers are
-    /// considered on the next call. If the return count has not changed since
-    /// depletion was recorded, a kernel availability query detects buffers that
-    /// were returned before the terminal CQE was dispatched. This query is only
-    /// made for parked receives, outside normal packet processing. No allocations
-    /// occur in the recovery layer.
+    /// considered on the next call. Return credits are reserved once per staged
+    /// receive across calls. Before any receive is staged, a kernel availability
+    /// query can detect buffers returned before depletion was dispatched. A failed
+    /// query does not prevent other records from using known return credits.
+    /// No allocations occur in the recovery layer.
     ///
     /// # Errors
     /// Returns an error for an inactive group, recursive recovery, failed kernel
@@ -331,7 +360,7 @@ impl ProvidedBufRing {
             || {
                 // SAFETY: Construction retains the live, thread-confined ring
                 // and its registered buffer mapping. This query only reads its
-                // producer tail and the kernel group head before callbacks run.
+                // producer tail and kernel group head on the owning thread.
                 let count = unsafe {
                     liburing_sys::io_uring_buf_ring_available(
                         self.ring.as_ptr(),
@@ -342,7 +371,7 @@ impl ProvidedBufRing {
                 if count < 0 {
                     Err(kernel_error(count))
                 } else {
-                    Ok(count > 0)
+                    Ok(count as u64)
                 }
             },
             submitter,
@@ -390,7 +419,8 @@ impl ProvidedBufRing {
     /// A negative result returns its original syscall error after recycling any
     /// valid selected buffer; a negative result without a selection only returns
     /// the syscall error. Invalid selected-buffer metadata is rejected without
-    /// republishing a buffer and takes precedence over the syscall error.
+    /// republishing a buffer and takes precedence over the syscall error, except
+    /// an oversized payload returns its valid, unleased selected buffer.
     ///
     /// # Panics
     /// Does not panic.
@@ -416,12 +446,14 @@ impl ProvidedBufRing {
             .buffers
             .get(usize::from(id.0))
             .ok_or_else(|| invalid("completion buffer ID is outside the group"))?;
-        if result > 0 && result as u32 > self.buffer_len {
-            return Err(invalid("completion payload exceeds buffer capacity"));
-        }
-        if buffer.leased.replace(true) {
+        if buffer.leased.get() {
             return Err(invalid("selected buffer is already leased"));
         }
+        if result > 0 && result as u32 > self.buffer_len {
+            self.return_buffer(id);
+            return Err(invalid("completion payload exceeds buffer capacity"));
+        }
+        buffer.leased.set(true);
         let lease = PbufLease {
             owner: self,
             id,
@@ -474,8 +506,8 @@ impl ProvidedBufRing {
         let buffer = &self.buffers[usize::from(id)];
         // SAFETY: UnsafeCell permits kernel writes while the owner is borrowed.
         // The stable allocation remains alive through unregistration. This slot
-        // is either unpublished at setup or exclusively held by the returning
-        // lease; offset is within the ring's available descriptor capacity.
+        // is unpublished at setup or exclusively owned after CQE/lease handoff;
+        // offset is within the ring's available descriptor capacity.
         unsafe {
             liburing_sys::uring_shim_buf_ring_add(
                 self.buffer_ring.as_ptr(),
@@ -490,7 +522,7 @@ impl ProvidedBufRing {
 
     fn return_buffer(&self, id: BufferId) {
         self.publish(id.0, 0);
-        // SAFETY: The returning lease exclusively owns the selected buffer and
+        // SAFETY: CQE handoff or a returning lease grants exclusive buffer ownership.
         // publish initialized the descriptor at the current producer tail.
         unsafe {
             liburing_sys::uring_shim_buf_ring_advance(self.buffer_ring.as_ptr(), 1);
@@ -598,16 +630,17 @@ mod unit {
         id::{BufGroupId, OpId},
     };
 
-    fn unavailable() -> crate::error::Result<bool> {
-        Ok(false)
+    fn unavailable() -> crate::error::Result<u64> {
+        Ok(0)
     }
 
     #[test]
     fn scenario_buffers_returned_before_depletion_and_query_failure() -> crate::error::Result<()> {
-        let pending = DepletedRecvs::new(1);
+        let pending = DepletedRecvs::new(2);
         let group = BufGroupId(2);
         let id = OpId::from_raw(3);
         pending.mark(10, 0, id, 4)?;
+        pending.mark(11, 0, OpId::from_raw(4), 4)?;
         let status_failure = UringError::syscalls("buf_ring_head", libc::EIO);
         assert_eq!(
             pending.rearm(
@@ -619,16 +652,14 @@ mod unit {
             Err(status_failure)
         );
         assert_eq!(
-            pending.rearm(4, group, unavailable, |_, _, _, _| panic!(
-                "no buffer available"
-            )),
+            pending.rearm(4, group, unavailable, |_, _, _, _| panic!("empty")),
             Ok(0)
         );
         assert_eq!(
             pending.rearm(
                 4,
                 group,
-                || Ok(true),
+                || Ok(1),
                 |fd, _, op, _| {
                     assert_eq!((fd, op), (10, id));
                     Ok(())
@@ -637,20 +668,31 @@ mod unit {
             Ok(1)
         );
         assert_eq!(
-            pending.rearm(
-                4,
-                group,
-                || panic!("no pending receive"),
-                |_, _, _, _| panic!("already rearmed")
-            ),
+            pending.rearm(4, group, || Ok(1), |_, _, _, _| panic!("reserved")),
             Ok(0)
         );
+        let pending = DepletedRecvs::new(2);
+        pending.mark(10, 0, id, 0)?;
+        pending.mark(11, 0, OpId::from_raw(4), 0)?;
+        assert!(pending.forget(id)?);
+        pending.mark(10, 0, id, 1)?;
+        let mut calls = 0;
+        let result = pending.rearm(
+            1,
+            group,
+            || Err(status_failure),
+            |_, _, _, _| {
+                calls += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(status_failure));
+        assert_eq!(calls, 1);
         Ok(())
     }
 
     #[test]
-    fn lifecycle_scenario_depleted_receive_waits_for_return_and_retains_failed_retry()
-    -> crate::error::Result<()> {
+    fn lifecycle_scenario_depleted_receive_retry() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(1);
         let op_id = OpId::from_raw(7);
         let group = BufGroupId(9);
@@ -690,8 +732,7 @@ mod unit {
     }
 
     #[test]
-    fn scenario_new_depletion_during_callback_waits_for_its_own_replenishment()
-    -> crate::error::Result<()> {
+    fn scenario_callback_depletion_waits_for_new_return() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(2);
         let first = OpId::from_raw(1);
         let second = OpId::from_raw(2);
@@ -722,8 +763,7 @@ mod unit {
     }
 
     #[test]
-    fn lifecycle_scenario_recovery_rejects_recursion_and_survives_callback_panic()
-    -> crate::error::Result<()> {
+    fn lifecycle_scenario_reentrant_and_panicking_recovery() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(2);
         let first = OpId::from_raw(1);
         let second = OpId::from_raw(2);

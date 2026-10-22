@@ -17,6 +17,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Free,
+    Retired,
     CheckedOut,
     InFlight,
     Quarantined,
@@ -174,6 +175,7 @@ impl FixedBufferPool {
     ///
     /// # Errors
     /// Returns an error if unregistered, exhausted, or a slot generation is spent.
+    /// A spent slot is permanently retired; later calls can use remaining slots.
     ///
     /// # Panics
     /// This function does not panic.
@@ -182,18 +184,12 @@ impl FixedBufferPool {
             return Err(error(libc::ENXIO));
         }
         let mut free = self.inner.free.borrow_mut();
-        let id = free
-            .last()
-            .copied()
-            .ok_or(UringError::FixedBuffersExhausted)?;
+        let id = free.pop().ok_or(UringError::FixedBuffersExhausted)?;
         let slot = &self.inner.slots[usize::from(id)];
-        let generation = slot
-            .generation
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| error(libc::EOVERFLOW))?;
-        let remaining = free.len() - 1;
-        free.truncate(remaining);
+        let Some(generation) = slot.generation.get().checked_add(1) else {
+            slot.state.set(State::Retired);
+            return Err(error(libc::EOVERFLOW));
+        };
         slot.generation.set(generation);
         slot.state.set(State::CheckedOut);
         Ok(FixedBufHandle {
@@ -223,7 +219,9 @@ impl FixedBufferPool {
 
     /// Release a submitted or quarantined buffer after its final completion.
     ///
-    /// A stale waiting token cannot quarantine a later checkout of this slot.
+    /// This ID-only operation cannot detect an earlier checkout's completion.
+    /// Prefer [`Self::reclaim_completed_generation`] with a generation retained
+    /// from [`InFlightWaitingBuffer::generation`] when completions can arrive late.
     ///
     /// # Errors
     /// Returns an error for an unknown, free, or checked-out buffer ID.
@@ -251,6 +249,37 @@ impl FixedBufferPool {
         Ok(())
     }
 
+    /// Release the exact submitted checkout identified by its ID and generation.
+    ///
+    /// Retain [`InFlightWaitingBuffer::generation`] alongside the operation's
+    /// completion identity before abandoning its waiting token. A stale
+    /// completion cannot release a buffer checked out for another operation.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown ID, a stale generation, or a slot that is
+    /// not submitted or quarantined. Rejection leaves the current owner intact.
+    ///
+    /// # Panics
+    /// This function does not panic.
+    ///
+    /// # Safety
+    /// The matching operation must satisfy the final-CQE and no-further-DMA
+    /// contract of [`Self::reclaim_completed`]. A generation check does not prove
+    /// that a completion is final or that zero-copy notifications have arrived.
+    pub unsafe fn reclaim_completed_generation(&self, id: BufferId, generation: u64) -> Result<()> {
+        let slot = self
+            .inner
+            .slots
+            .get(usize::from(id.0))
+            .ok_or_else(|| error(libc::EINVAL))?;
+        if slot.generation.get() != generation {
+            return Err(UringError::BufferNotInFlight(id.0));
+        }
+        // SAFETY: The caller establishes final completion for this generation,
+        // and the check above excludes reclaiming a later checkout of the slot.
+        unsafe { self.reclaim_completed(id) }
+    }
+
     /// Unregister an idle pool while reporting kernel errors to its owner.
     ///
     /// A successful call permanently disables checkout. Calling again succeeds.
@@ -265,7 +294,12 @@ impl FixedBufferPool {
         if !self.inner.registered.get() {
             return Ok(());
         }
-        if self.available() != self.capacity() {
+        if self
+            .inner
+            .slots
+            .iter()
+            .any(|slot| !matches!(slot.state.get(), State::Free | State::Retired))
+        {
             return Err(error(libc::EBUSY));
         }
         let result = self.inner.unregister_kernel();
@@ -382,6 +416,18 @@ impl InFlightWaitingBuffer {
     #[must_use]
     pub const fn id(&self) -> BufferId {
         self.id
+    }
+
+    /// Return the checkout generation to retain with the operation's completion ID.
+    ///
+    /// Use it with [`FixedBufferPool::reclaim_completed_generation`] if this
+    /// waiting token must be dropped before the target's final completion.
+    ///
+    /// # Panics
+    /// This function does not panic.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Mark cancellation or abandonment without authorizing memory reuse.
@@ -584,6 +630,67 @@ mod unit_lifecycle_scenario {
             assert_eq!(pool.available(), 1);
             detach(&pool);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn spent_generation_retires_without_blocking_other_slots_or_unregister() -> Result<()> {
+        let mut pool = pool(2);
+        pool.inner.slots[0].generation.set(u64::MAX);
+        assert!(matches!(
+            pool.checkout(),
+            Err(UringError::Syscall {
+                errno: libc::EOVERFLOW,
+                ..
+            })
+        ));
+        assert_eq!(pool.inner.slots[0].state.get(), State::Retired);
+        assert_eq!(pool.available(), 1);
+        let remaining = pool.checkout()?;
+        assert_eq!(remaining.id(), BufferId(1));
+        assert!(pool.unregister().is_err());
+        drop(remaining);
+        pool.inner.slots[1].generation.set(u64::MAX);
+        assert!(matches!(
+            pool.checkout(),
+            Err(UringError::Syscall {
+                errno: libc::EOVERFLOW,
+                ..
+            })
+        ));
+        assert_eq!(pool.inner.slots[1].state.get(), State::Retired);
+        assert_eq!(pool.available(), 0);
+        assert!(matches!(
+            pool.checkout(),
+            Err(UringError::FixedBuffersExhausted)
+        ));
+        pool.unregister()?;
+        assert!(!pool.inner.registered.get());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_completion_generation_cannot_reclaim_reused_in_flight_buffer() -> Result<()> {
+        let pool = pool(1);
+        let old = pool.checkout()?.into_in_flight();
+        let id = old.id();
+        let old_generation = old.generation();
+        // SAFETY: No SQE was submitted, so this operation has no kernel access.
+        unsafe { pool.reclaim_completed_generation(id, old_generation)? };
+        let current = pool.checkout()?.into_in_flight();
+        let current_generation = current.generation();
+        assert_ne!(old_generation, current_generation);
+        drop(old);
+        // SAFETY: The old operation never reached the kernel; only its stale
+        // identity is supplied, and rejection must preserve the current owner.
+        let stale = unsafe { pool.reclaim_completed_generation(id, old_generation) };
+        assert!(matches!(stale, Err(UringError::BufferNotInFlight(_))));
+        assert_eq!(pool.available(), 0);
+        assert_eq!(pool.inner.slots[0].state.get(), State::InFlight);
+        // SAFETY: The current operation also remained entirely in user space.
+        drop(unsafe { current.complete()? });
+        assert_eq!(pool.available(), 1);
+        detach(&pool);
         Ok(())
     }
 
