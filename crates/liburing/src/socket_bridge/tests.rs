@@ -11,6 +11,7 @@ type Requests = Rc<RefCell<Vec<(u64, BridgeSubmission<u64>)>>>;
 struct Recorder {
     requests: Requests,
     fail: Rc<Cell<bool>>,
+    fail_fd: Rc<Cell<Option<RawFd>>>,
 }
 impl UringSocketOps for Recorder {
     type OpId = u64;
@@ -19,6 +20,16 @@ impl UringSocketOps for Recorder {
         SUBSYSTEM
     }
     fn submit(&mut self, token: u64, op: BridgeSubmission<u64>) -> Result<u64, Self::Error> {
+        let fd = match op {
+            BridgeSubmission::PollAdd { fd, .. }
+            | BridgeSubmission::PollRemove { fd, .. }
+            | BridgeSubmission::Cancel { fd, .. }
+            | BridgeSubmission::Connect { fd, .. }
+            | BridgeSubmission::Close { fd } => fd,
+        };
+        if self.fail_fd.get() == Some(fd) {
+            return Err("adapter down");
+        }
         if self.fail.replace(false) {
             return Err("queue full");
         }
@@ -30,19 +41,23 @@ struct Harness {
     bridge: UringSocketBridge<Recorder>,
     requests: Requests,
     fail: Rc<Cell<bool>>,
+    fail_fd: Rc<Cell<Option<RawFd>>>,
 }
 impl Harness {
     fn new() -> Result<Self, BridgeError<&'static str>> {
         let requests = Rc::new(RefCell::new(Vec::new()));
         let fail = Rc::new(Cell::new(false));
+        let fail_fd = Rc::new(Cell::new(None));
         let ops = Recorder {
             requests: Rc::clone(&requests),
             fail: Rc::clone(&fail),
+            fail_fd: Rc::clone(&fail_fd),
         };
         Ok(Self {
             bridge: UringSocketBridge::new(SUBSYSTEM, ops, 1)?,
             requests,
             fail,
+            fail_fd,
         })
     }
     fn token(&self, index: usize) -> u64 {
@@ -251,5 +266,98 @@ fn socket_growth_keeps_larger_pending_table_and_high_slot_operations()
     assert_eq!(event.map(|event| event.fd), Some(7));
     let event = h.bridge.on_cqe(h.token(1), i32::from(libc::POLLOUT), false);
     assert_eq!(event.map(|event| event.fd), Some(8));
+    Ok(())
+}
+
+#[test]
+fn connect_completion_maps_success_and_failure_without_closing()
+-> Result<(), BridgeError<&'static str>> {
+    let mut h = Harness::new()?;
+    let address = SocketAddr::from(([127, 0, 0, 1], 80));
+    h.bridge.register(7)?;
+    h.bridge.connect(7, address)?;
+    assert_eq!(
+        h.bridge.on_cqe(h.token(0), 0, false),
+        Some(BridgeEvent {
+            fd: 7,
+            interest: SocketInterest::WRITABLE,
+            result: 0,
+            kind: BridgeOpKind::Connect,
+        })
+    );
+    h.bridge.connect(7, address)?;
+    assert_eq!(
+        h.bridge.on_cqe(h.token(1), -libc::ECONNREFUSED, false),
+        Some(BridgeEvent {
+            fd: 7,
+            interest: SocketInterest::READABLE | SocketInterest::WRITABLE,
+            result: -libc::ECONNREFUSED,
+            kind: BridgeOpKind::Connect,
+        })
+    );
+    h.bridge.connect(7, address)?;
+    assert_eq!(
+        h.requests.borrow()[2].1,
+        BridgeSubmission::Connect { fd: 7, address }
+    );
+    Ok(())
+}
+
+#[test]
+fn pollrdhup_completion_maps_to_readable() -> Result<(), BridgeError<&'static str>> {
+    let mut h = Harness::new()?;
+    h.bridge.register(7)?;
+    h.bridge.set_interest(7, SocketInterest::READABLE)?;
+    assert_eq!(
+        h.bridge
+            .on_cqe(h.token(0), i32::from(libc::POLLRDHUP), false),
+        Some(BridgeEvent {
+            fd: 7,
+            interest: SocketInterest::READABLE,
+            result: i32::from(libc::POLLRDHUP),
+            kind: BridgeOpKind::PollAdd,
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn drive_attempts_later_sockets_after_first_error() -> Result<(), BridgeError<&'static str>> {
+    let mut h = Harness::new()?;
+    h.bridge.register(7)?;
+    h.bridge.register(8)?;
+    h.fail.set(true);
+    assert_eq!(
+        h.bridge.set_interest(7, SocketInterest::READABLE),
+        Err(BridgeError::Submission("queue full"))
+    );
+    h.fail.set(true);
+    assert_eq!(
+        h.bridge.set_interest(8, SocketInterest::READABLE),
+        Err(BridgeError::Submission("queue full"))
+    );
+    h.fail_fd.set(Some(7));
+    assert_eq!(
+        h.bridge.drive(),
+        Err(BridgeError::Submission("adapter down"))
+    );
+    assert_eq!(h.count(), 1);
+    assert_eq!(
+        h.requests.borrow()[0].1,
+        BridgeSubmission::PollAdd {
+            fd: 8,
+            interest: SocketInterest::READABLE
+        }
+    );
+    h.fail_fd.set(None);
+    h.bridge.drive()?;
+    assert_eq!(h.count(), 2);
+    assert_eq!(
+        h.requests.borrow()[1].1,
+        BridgeSubmission::PollAdd {
+            fd: 7,
+            interest: SocketInterest::READABLE
+        }
+    );
     Ok(())
 }

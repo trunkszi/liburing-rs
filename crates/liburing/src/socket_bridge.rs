@@ -445,15 +445,27 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
     /// Stages pending poll replacements, cancellation controls, and closes.
     ///
     /// # Errors
-    /// Returns the first adapter/capacity error. Previously staged operations
-    /// remain tracked; calling again retries only unfinished transitions.
+    /// Every registered socket is attempted. The first adapter/capacity error,
+    /// in socket registration order, is returned after the full pass; a failure
+    /// for one socket does not prevent later sockets from being driven.
+    /// Previously staged operations remain tracked, so a later call retries only
+    /// unfinished transitions.
     /// # Panics
     /// Never panics.
     pub fn drive(&mut self) -> Result<(), BridgeError<O::Error>> {
+        let mut first_error = None;
         for index in 0..self.sockets.len() {
-            self.drive_socket(index)?;
+            if let Err(error) = self.drive_socket(index)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(())
+        if let Some(error) = first_error {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     fn index(&self, fd: RawFd) -> Option<usize> {

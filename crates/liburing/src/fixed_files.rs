@@ -186,16 +186,23 @@ impl FixedFileTable {
 
     /// Expands registration to at least `min_capacity`, preserving slot indices.
     ///
+    /// This is a synchronous control-plane call. Replacing the kernel table
+    /// first unregisters the old one, which may block while the kernel retires
+    /// outstanding fixed-file operations, so it must not run on a hot path.
+    ///
     /// Capacity at least doubles and never exceeds `i32::MAX`. Allocation is
     /// completed before replacing the kernel table. No SQEs may be submitted by
     /// another owner during replacement; construction already requires exclusive
     /// registration ownership. A failed replacement attempts to restore the old
-    /// table. Private close-on-exec duplicates preserve each file identity even
-    /// after the caller closes or reuses its original descriptor.
-    /// If restoration fails, the table becomes unregistered, retained references
-    /// are released, and all slot lookups and modifications fail. Run growth on
-    /// the control plane after prior fixed-file I/O retires; kernel
-    /// unregistration can wait for outstanding operations.
+    /// table; that rollback is best effort. Private close-on-exec duplicates
+    /// preserve each file identity even after the caller closes or reuses its
+    /// original descriptor.
+    ///
+    /// After a failed rollback, including a failed restore of the previous
+    /// table, the table is unregistered and its retained references and slot
+    /// bookkeeping are cleared, so all slot lookups and modifications fail.
+    /// Callers can distinguish that state from an intact table with
+    /// [`Self::is_registered`].
     ///
     /// # Errors
     /// Returns an error for an unregistered table, an oversized request,
@@ -269,6 +276,8 @@ impl FixedFileTable {
             self.registered = register(Some(&files[..old_cap])).is_ok();
             if !self.registered {
                 self.retained.clear();
+                self.entries.clear();
+                self.free.clear();
             }
             return Err(error);
         }
@@ -283,6 +292,12 @@ impl FixedFileTable {
     ///
     /// This does not close the original OS descriptor. The caller must retire
     /// all operations using the slot before scheduling operations after reuse.
+    ///
+    /// The returned value is the descriptor number originally supplied for the
+    /// slot, not the table's private `F_DUPFD_CLOEXEC` duplicate. It remains a
+    /// valid handle only while the caller keeps that original descriptor open.
+    /// After the caller closes or reuses the number, treat it as a bookkeeping
+    /// identifier only and do not close it again.
     ///
     /// # Errors
     /// Returns an error for an unregistered, out-of-range, or empty slot, or a
@@ -303,7 +318,11 @@ impl FixedFileTable {
     ///
     /// No registration syscall is issued because `CLOSE_DIRECT` already removed
     /// the kernel reference. The returned value identifies the originally
-    /// registered descriptor; it does not transfer descriptor ownership.
+    /// registered descriptor; it does not transfer descriptor ownership. It
+    /// remains a valid handle only while the caller keeps that original
+    /// descriptor open. After the caller closes or reuses the number, treat it
+    /// as a bookkeeping identifier only: never close it again and never assume
+    /// it names the slot's current file.
     ///
     /// # Errors
     /// Returns an error if the table is unregistered or the slot is invalid or
@@ -327,6 +346,13 @@ impl FixedFileTable {
 
     /// Returns the original descriptor associated with a currently occupied slot.
     ///
+    /// The returned value is the descriptor number the caller supplied when the
+    /// slot was inserted or registered, not the table's private
+    /// `F_DUPFD_CLOEXEC` duplicate. It remains a valid handle only while the
+    /// caller keeps that original descriptor open. After the caller closes or
+    /// reuses the number, treat the result as a bookkeeping identifier only:
+    /// never close it again and never assume it names the slot's current file.
+    ///
     /// # Panics
     /// Does not panic; out-of-range and unregistered slots return `None`.
     #[must_use]
@@ -336,6 +362,21 @@ impl FixedFileTable {
         } else {
             None
         }
+    }
+
+    /// Returns whether the kernel currently holds this table's registration.
+    ///
+    /// This is `false` after a successful [`Self::unregister`] and after a
+    /// failed rollback during [`Self::grow`]. While it is `false`, slot lookups
+    /// and modifications fail: [`Self::get`] returns `None`, and
+    /// [`Self::insert`], [`Self::remove`], and [`Self::grow`] return errors.
+    /// Repeated [`Self::unregister`] calls are no-ops.
+    ///
+    /// # Panics
+    /// Does not panic.
+    #[must_use]
+    pub const fn is_registered(&self) -> bool {
+        self.registered
     }
 
     /// Returns the current number of registered slots, including empty slots.
@@ -521,6 +562,7 @@ mod tests {
         });
         assert_eq!(result, Err(errno(EINVAL)));
         assert!(table.registered);
+        assert!(table.is_registered());
         assert_eq!(table.entries, [Some(10), None, Some(12)]);
         assert_eq!(table.free, [1]);
         assert_eq!(calls, [None, Some(expanded), Some(originals)]);
@@ -551,6 +593,10 @@ mod tests {
         );
         assert_eq!(calls, 3);
         assert!(!table.registered);
+        assert!(!table.is_registered());
+        assert_eq!(table.capacity(), 0);
+        assert!(table.entries.is_empty());
+        assert!(table.free.is_empty());
         assert!(matches!(peer.read(&mut [0]), Ok(0)));
         assert_eq!(table.get(UringFileSlot(0)), None);
         assert_eq!((table.len(), table.available()), (0, 0));
