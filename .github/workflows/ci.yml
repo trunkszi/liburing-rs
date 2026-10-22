@@ -1,0 +1,105 @@
+name: liburing-rs CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.png'
+  pull_request:
+    paths-ignore:
+      - '**.png'
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  RUST_TEST_THREADS: "1"
+  NEXTEST_TEST_THREADS: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: Unified Incremental CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check runner isolation
+        run: bash .github/scripts/check-runner-isolation.sh
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential clang libclang-dev
+
+      - name: Check system dependencies
+        run: |
+          missing=""
+          for tool in cc make curl git python3 readelf clang flock; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::$(hostname) is missing required build tools:$missing"
+            exit 1
+          fi
+          cc --version | head -n 1
+          ldconfig -p | grep libclang
+
+      - name: Put the Rust toolchain on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        run: bash .github/scripts/install-rust-toolchain.sh
+
+      - name: Resolve the diff base
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          candidates=()
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              candidates=("$PR_BASE_SHA")
+              ;;
+            push)
+              if [ -n "${PUSH_BEFORE_SHA//0/}" ]; then
+                candidates+=("$PUSH_BEFORE_SHA")
+              fi
+              branch_point="$(git merge-base origin/main HEAD 2>/dev/null || true)"
+              if [ -n "$branch_point" ] && [ "$branch_point" != "$(git rev-parse HEAD)" ]; then
+                candidates+=("$branch_point")
+              fi
+              candidates+=(HEAD~1)
+              ;;
+            *)
+              candidates=(HEAD~1)
+              ;;
+          esac
+          base=""
+          for candidate in "${candidates[@]}"; do
+            if [ -n "$candidate" ] && git cat-file -e "$candidate^{commit}" 2>/dev/null; then
+              base="$(git rev-parse "$candidate^{commit}")"
+              break
+            fi
+          done
+          if [ -z "$base" ]; then
+            base="$(git rev-parse HEAD)"
+          fi
+          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          echo "diff base: $base"
+
+      - name: Run unified incremental CI
+        run: bash .github/scripts/ci-incremental.sh "$BASE_SHA"
