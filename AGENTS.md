@@ -1,8 +1,8 @@
 # Agent Guide
 
-Operational contract for contributors working in `liburing-rs`. Use [README.md](README.md)
-for architecture and integration guidance. Cargo manifests and source define the
-current API and build behavior.
+Operational contract for contributors working in `liburing-rs`. Use crate rustdoc
+for API and ownership contracts, and [README.md](README.md) for getting started.
+Cargo manifests and source define the current API and build behavior.
 
 ## Repository Boundaries
 
@@ -57,7 +57,8 @@ README command and keep descriptor/DMA owners alive through their final CQEs.
   `rearm_depleted_recvs` after lease returns. Its callback stages exactly one
   receive on success and nothing on error; failed records remain retryable.
   Remove parked records with `forget_depleted_recv` before fd close.
-- Preserve socket generation and poll-sequence checks in `UringSocketBridge`.
+- Preserve never-reused bridge tokens and current-interest/superseded checks in
+  `UringSocketBridge`; buffer generations belong to `FixedBufferPool`.
   Validate interest replacement, late completions, close races, and negative CQE
   results whenever changing the bridge.
 
@@ -124,12 +125,13 @@ buffer reuse, routing, and wakeup changes. Add
 `--no-default-features --features stable` when feature behavior is affected.
 
 Runtime tests need Linux with permitted `io_uring` and support for the exercised
-operations. Distinguish skipped kernel-dependent assertions from executed tests.
+operations. Required kernel capabilities must fail visibly rather than skip tests.
 Report actual commands, results, and uncovered boundaries. End with
 `git diff --check` and a review of the changed paths. Pure documentation edits
 need factual, reference, and diff checks rather than a full native rebuild.
 
-The incremental gate builds and runs all three examples on every invocation,
-including when the package selection is empty. Example ring initialization and
-missing kernel capabilities must fail visibly. Use bounded completion waits;
-run examples before reporting an example change complete.
+The incremental gate discovers all `crates/liburing/examples/*.rs` targets and
+builds and runs them after the package gates, including with an empty package
+selection. It also runs stable examples when `liburing` or `liburing-sys` is
+selected. Example ring initialization and missing kernel capabilities must fail
+visibly. Use bounded completion waits; run examples before reporting completion.

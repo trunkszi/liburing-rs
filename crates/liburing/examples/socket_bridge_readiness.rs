@@ -108,7 +108,7 @@ impl Driver {
 
     fn flush(&mut self, proactor: &mut Proactor) -> ExampleResult {
         loop {
-            let Some((id, op)) = self.queue.borrow_mut().pop_front() else {
+            let Some((id, op)) = self.queue.borrow().front().copied() else {
                 break;
             };
             let address = match op {
@@ -163,6 +163,7 @@ impl Driver {
                     }
                 }
             })?;
+            self.queue.borrow_mut().pop_front();
         }
         proactor.submit()?;
         Ok(())
@@ -192,8 +193,8 @@ impl Driver {
         Ok(())
     }
 
-    fn count(&self, kind: BridgeOpKind) -> usize {
-        self.events
+    fn count_since(&self, start: usize, kind: BridgeOpKind) -> usize {
+        self.events[start..]
             .iter()
             .filter(|event| event.kind == kind)
             .count()
@@ -218,6 +219,7 @@ fn main() -> ExampleResult {
     let mut proactor = Proactor::builder().entries(32).build()?;
     proactor.register_subsystem(ROUTE, CompletionOwner(Rc::clone(&resources)))?;
     let mut clients = Vec::new();
+    let connect_start = driver.events.len();
     for _ in 0..CLIENTS {
         // SAFETY: socket has no pointer arguments and creates a fresh fd.
         let fd = unsafe {
@@ -236,10 +238,13 @@ fn main() -> ExampleResult {
         clients.push(fd);
     }
     println!("Registered {CLIENTS} nonblocking sockets from initial bridge capacity 1.");
-    while driver.count(BridgeOpKind::Connect) < CLIENTS {
+    while driver.count_since(connect_start, BridgeOpKind::Connect) < CLIENTS {
         driver.batch(&mut proactor, &mut bridge)?;
     }
-    for event in &driver.events {
+    for event in driver.events[connect_start..]
+        .iter()
+        .filter(|event| event.kind == BridgeOpKind::Connect)
+    {
         if event.result != 0 || !event.interest.contains(SocketInterest::WRITABLE) {
             return Err(io::Error::other(format!("connect failed: {event:?}")).into());
         }
@@ -254,14 +259,14 @@ fn main() -> ExampleResult {
             Err(error) => return Err(error.into()),
         }
     }
+    let writable_start = driver.events.len();
     for &fd in &clients {
         bridge.set_interest(fd, SocketInterest::WRITABLE)?;
     }
-    while driver.count(BridgeOpKind::PollAdd) < CLIENTS {
+    while driver.count_since(writable_start, BridgeOpKind::PollAdd) < CLIENTS {
         driver.batch(&mut proactor, &mut bridge)?;
     }
-    for event in driver
-        .events
+    for event in driver.events[writable_start..]
         .iter()
         .filter(|event| event.kind == BridgeOpKind::PollAdd)
     {
@@ -338,22 +343,25 @@ fn main() -> ExampleResult {
     for &fd in &clients {
         bridge.set_interest(fd, SocketInterest::EMPTY)?;
     }
-    while driver.events[removal_start..]
-        .iter()
-        .filter(|event| event.kind == BridgeOpKind::PollRemove)
-        .count()
-        < CLIENTS
-    {
+    while driver.count_since(removal_start, BridgeOpKind::PollRemove) < CLIENTS {
         driver.batch(&mut proactor, &mut bridge)?;
     }
+    for event in driver.events[removal_start..]
+        .iter()
+        .filter(|event| event.kind == BridgeOpKind::PollRemove)
+    {
+        if event.result < 0 && ![-libc::ENOENT, -libc::EALREADY].contains(&event.result) {
+            return Err(io::Error::other(format!("poll removal failed: {event:?}")).into());
+        }
+    }
+    let close_start = driver.events.len();
     for &fd in &clients {
         bridge.close(fd)?;
     }
-    while driver.count(BridgeOpKind::Close) < CLIENTS {
+    while driver.count_since(close_start, BridgeOpKind::Close) < CLIENTS {
         driver.batch(&mut proactor, &mut bridge)?;
     }
-    for event in driver
-        .events
+    for event in driver.events[close_start..]
         .iter()
         .filter(|event| event.kind == BridgeOpKind::Close)
     {

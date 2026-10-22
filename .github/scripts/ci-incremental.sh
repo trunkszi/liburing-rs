@@ -99,13 +99,27 @@ print('Source and manifest invariants passed')
 PY
 
 # Examples exercise the real kernel even when no package was selected by the diff.
-run_examples() {
-  cargo build -p liburing --examples
-  for example in proactor_subsystems_and_waker fixed_files_and_pbuf_tcp_echo socket_bridge_readiness; do
-    echo "Running example: $example"
-    timeout 30s cargo run -p liburing --example "$example"
+run_examples() (
+  shopt -s nullglob
+  local example_sources=(crates/liburing/examples/*.rs)
+  local feature_args=()
+  local mode="${1:-default}"
+  local source example
+  if [ "${#example_sources[@]}" -eq 0 ]; then
+    echo 'No Rust examples found in crates/liburing/examples' >&2
+    return 1
+  fi
+  if [ "$mode" = stable ]; then
+    feature_args=(--no-default-features --features stable)
+  fi
+  cargo build -p liburing --examples "${feature_args[@]}"
+  for source in "${example_sources[@]}"; do
+    example="${source##*/}"
+    example="${example%.rs}"
+    echo "Running example ($mode): $example"
+    timeout 30s cargo run -p liburing --example "$example" "${feature_args[@]}"
   done
-}
+)
 
 run_all=0
 case "${GITHUB_EVENT_NAME:-}" in schedule|workflow_dispatch) run_all=1 ;; esac
@@ -133,9 +147,11 @@ for package in metadata["packages"]:
 ' <<< "$metadata")"
 mapfile -t packages <<< "$package_names"
 selected=()
+run_stable_examples=0
 for package in "${packages[@]}"; do
   if [ "$run_all" -eq 1 ] || [ -n "${affected[$package]:-}" ]; then
     selected+=("$package")
+    case "$package" in liburing|liburing-sys) run_stable_examples=1 ;; esac
   fi
 done
 cargo fmt --all -- --check
@@ -182,4 +198,7 @@ PY
   done
 fi
 run_examples
+if [ "$run_stable_examples" -eq 1 ]; then
+  run_examples stable
+fi
 echo "Incremental CI passed: ${selected[*]}"

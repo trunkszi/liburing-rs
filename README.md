@@ -4,8 +4,8 @@ A single-threaded Linux `io_uring` foundation for completion-driven applications
 
 - One thread owns each `Proactor`; callbacks stage follow-up work, and cross-thread
   control uses an eventfd waker with a bounded command queue.
-- Upstream liburing is compiled statically: `pre-release` tracks `master` by
-  default; `stable` selects `liburing-2.15`. Select exactly one feature.
+- Upstream liburing is compiled statically: default `pre-release` selects `master`
+  (first fetch, then cache reuse); `stable` selects `liburing-2.15`. Choose one.
 - `OpId` carries an 8-bit subsystem ID and a 56-bit application payload, with
   derive macros for typed codecs and validated subsystem declarations.
 - `FixedFileTable` and `UringSocketBridge` grow dynamically; `FixedBufferPool`
@@ -29,7 +29,7 @@ Configure a thread-local ring, register a handler, and drive a completion:
 
 ```rust
 use liburing::{Completion, OpId, OpPayload, Proactor, Result,
-    SubmissionContext, SubsystemHandler, SubsystemId};
+    SubmissionContext, SubsystemHandler, SubsystemId, UringError};
 
 struct Handler;
 impl SubsystemHandler for Handler {
@@ -42,7 +42,7 @@ impl SubsystemHandler for Handler {
 
 fn main() -> Result<()> {
     let mut ring = Proactor::builder().entries(16).build()?;
-    let subsystem = SubsystemId::new_unchecked(1);
+    let subsystem = SubsystemId::new(1).ok_or(UringError::InvalidSubsystemId(1))?;
     ring.register_subsystem(subsystem, Handler)?;
     ring.alloc_sqe(OpId::pack(subsystem, OpPayload::new_unchecked(7)))?; // NOP
     ring.wait_completions(1, Some(std::time::Duration::from_secs(1)), |_, _| Ok(()))?;
@@ -87,9 +87,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 bash .github/scripts/ci-incremental.sh
 ```
 
-The incremental gate also builds and runs all three examples on every invocation,
-with a 30-second bound per example. Tests cover integration, lifecycle, scenarios,
-and local network E2E; failures to initialize a required kernel ring fail visibly.
+After package gates pass, the incremental gate discovers and runs all examples,
+with a 30-second bound each. Selecting `liburing` or `liburing-sys` also runs them
+with stable features. Tests cover integration, lifecycle, scenarios, and local
+network E2E; failures to initialize a required kernel ring fail visibly.
 
 ## License
 
