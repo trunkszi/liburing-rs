@@ -25,6 +25,11 @@ pub(crate) struct StagedSqe {
 }
 
 pub(crate) fn validate_prepared_sqe(sqe: &io_uring_sqe) -> Result<()> {
+    if u32::from(sqe.flags) & (liburing_sys::IOSQE_IO_LINK | liburing_sys::IOSQE_IO_HARDLINK) != 0 {
+        return Err(UringError::InvalidPreparedSqe(
+            "linked operations cannot preserve chains across staged submissions",
+        ));
+    }
     if u32::from(sqe.flags) & liburing_sys::IOSQE_CQE_SKIP_SUCCESS != 0 {
         return Err(UringError::InvalidConfig(
             "operations must produce their final completion",
@@ -63,7 +68,9 @@ impl<'a> SubmissionContext<'a> {
     /// has reached its fixed capacity. Rejects the internal subsystem with
     /// `InvalidSubsystemId` and the all-ones fallback timeout sentinel with
     /// `InvalidPayload`.
-    /// Rejects operations that skip final CQEs or inject message-ring CQEs.
+    /// Rejects operations that skip final CQEs or inject message-ring CQEs, and
+    /// returns `InvalidPreparedSqe` for linked operations because staged
+    /// submissions cannot preserve chains across kernel submission batches.
     ///
     /// # Panics
     /// Propagates a panic from `prepare`; the operation is not staged.
@@ -253,6 +260,33 @@ mod unit_scenario_tests {
             result: 0,
             flags: 0,
         }
+    }
+
+    #[test]
+    fn staging_rejects_link_flags_without_consuming_capacity() -> Result<()> {
+        let mut staged = VecDeque::with_capacity(1);
+        let mut context = SubmissionContext::new(&mut staged, 1);
+        let op_id = completion(1, 1).op_id;
+        for flags in [
+            liburing_sys::IOSQE_IO_LINK,
+            liburing_sys::IOSQE_IO_HARDLINK,
+            liburing_sys::IOSQE_IO_LINK | liburing_sys::IOSQE_IO_HARDLINK,
+        ] {
+            let result = context.prepare_sqe_with(op_id, |sqe| {
+                // SAFETY: The callback exclusively borrows an initialized SQE.
+                unsafe { (*sqe).flags = flags as u8 };
+            });
+            assert_eq!(
+                result,
+                Err(UringError::InvalidPreparedSqe(
+                    "linked operations cannot preserve chains across staged submissions"
+                ))
+            );
+            assert_eq!(context.remaining_capacity(), 1);
+        }
+        context.prepare_sqe_with(op_id, |_| {})?;
+        assert_eq!(context.remaining_capacity(), 0);
+        Ok(())
     }
 
     #[test]
