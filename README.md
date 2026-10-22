@@ -251,6 +251,31 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 bash .github/scripts/ci-incremental.sh
 ```
 
+### Test matrix
+
+`lifecycle_and_scenario_e2e` separates four dimensions into named test modules.
+Each uses a real Linux kernel ring: setup and missing required capabilities fail
+the test instead of producing a passing skip. Test infrastructure may create
+control-plane producer threads; ring submission and dispatch stay on one thread.
+
+| Dimension | Source under `crates/liburing/tests/` | Coverage | Focused command |
+| --- | --- | --- | --- |
+| Integration test | `lifecycle_and_scenario_e2e/integration.rs` | One proactor with growing fixed-file registration, stable slot I/O after original fd closure, generation-checked fixed-buffer recovery, cancel/target CQE isolation, and provided-buffer UDP leases. | `cargo test -p liburing --test lifecycle_and_scenario_e2e integration::` |
+| Lifecycle test | `lifecycle_and_scenario_e2e/lifecycle.rs` | Builder construction, multiple subsystems, registration, in-flight work, file-table growth, direct close and slot reuse, shutdown callback delivery, rejected follow-ups, and deterministic resource release. | `cargo test -p liburing --test lifecycle_and_scenario_e2e lifecycle::` |
+| Scenario test | `lifecycle_and_scenario_e2e/scenario*.rs` | Bridge growth and connect/poll/remove/close barriers with fd reuse; UDP buffer exhaustion and bounded rearming; concurrent wakeups, batch draining, and queue backpressure recovery. | `cargo test -p liburing --test lifecycle_and_scenario_e2e scenario::` |
+| E2E test | `lifecycle_and_scenario_e2e/e2e.rs` | A single-thread proactor loop drives local TCP/UDP traffic, timeout completion, and a cross-thread stop command through the control mailbox. | `cargo test -p liburing --test lifecycle_and_scenario_e2e e2e::` |
+
+Run the entire matrix in both native-source configurations:
+
+```bash
+cargo test -p liburing --test lifecycle_and_scenario_e2e
+cargo test -p liburing --test lifecycle_and_scenario_e2e --no-default-features --features stable
+```
+
+`proactor_and_waker`, `fixed_resources_and_pbuf`, `adversarial_proactor`,
+`socket_bridge_growth`, and `prepared_sqe_validation` retain narrower routing,
+resource, stress, growth, and rejected-SQE regressions alongside this matrix.
+
 The focused runtime stress target is:
 
 ```bash
