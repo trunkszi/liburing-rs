@@ -341,6 +341,44 @@ fn integration_lifecycle_scenario_pbuf_leases_replenish_after_enobufs()
     let recovered = unsafe { group.lease_from_cqe(cqe.flags, cqe.result)? };
     assert_eq!(&*recovered, b"after-pressure");
     recovered.release();
+    // Harvest a whole exhausted batch first. Its data buffers can be returned
+    // before the owner dispatches the already queued terminal ENOBUFS CQE.
+    for payload in [b"early-one".as_slice(), b"early-two", b"early-after"] {
+        sender.send(payload)?;
+    }
+    let batch = [ring.completion()?, ring.completion()?, ring.completion()?];
+    for (cqe, payload) in batch[..2].iter().zip([b"early-one", b"early-two"]) {
+        assert_eq!((cqe.id, cqe.result), (21, payload.len() as i32));
+        // SAFETY: Each genuine, unconsumed selected-buffer CQE transfers a
+        // distinct buffer; this receive uses no incremental-buffer mode.
+        let lease = unsafe { group.lease_from_cqe(cqe.flags, cqe.result)? };
+        assert_eq!(&*lease, payload);
+        lease.release();
+    }
+    assert_eq!((batch[2].id, batch[2].result), (21, -libc::ENOBUFS));
+    assert_eq!(batch[2].flags & liburing_sys::IORING_CQE_F_MORE, 0);
+    let returned_before_mark = group.returned_count();
+    group.mark_depleted_recv(receiver.as_raw_fd(), 0, OpId::from_raw(21))?;
+    assert_eq!(
+        group.rearm_depleted_recvs(|fd, flags, op_id, buffer_group| {
+            let sqe = ring.sqe(op_id.raw());
+            // SAFETY: The prior multishot ended, its buffers were returned
+            // before depletion dispatch, and the live group owns their storage.
+            unsafe { net::prep_recv_multishot(sqe, fd, buffer_group, flags) };
+            Ok(())
+        })?,
+        1,
+        "already returned buffers must allow recovery without another lease drop"
+    );
+    assert_eq!(group.returned_count(), returned_before_mark);
+    ring.submit()?;
+    let cqe = ring.completion()?;
+    assert_eq!((cqe.id, cqe.result), (21, 11));
+    // SAFETY: This unconsumed CQE grants exclusive access to a selected buffer
+    // of the rearmed receive, whose registration remains live below.
+    let lease = unsafe { group.lease_from_cqe(cqe.flags, cqe.result)? };
+    assert_eq!(&*lease, b"early-after");
+    lease.release();
     let sqe = ring.sqe(23);
     // SAFETY: User data 21 uniquely identifies the still-live multishot receive;
     // the group remains registered through the following final completion.
@@ -370,5 +408,48 @@ fn integration_lifecycle_scenario_pbuf_leases_replenish_after_enobufs()
     // SAFETY: Successful unregistration follows the target final CQE and every
     // lease return; this is the sole destruction of the retained group owner.
     unsafe { ManuallyDrop::drop(&mut group) };
+    Ok(())
+}
+
+#[test]
+fn integration_lifecycle_scenario_fixed_file_boundaries_preserve_free_slots()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ring = KernelRing::new()?;
+    let file = anonymous_file()?;
+    let raw = file.as_raw_fd();
+    // SAFETY: The stable ring outlives the table, this test exclusively owns
+    // registration, and the dense input contains a valid fd plus empty slots.
+    let mut files = unsafe { FixedFileTable::register(ring.pointer(), &[-1, raw, -1])? };
+    assert_eq!((files.len(), files.available()), (1, 2));
+    assert!(files.insert(i32::MAX).is_err());
+    assert!(files.insert(-2).is_err());
+    assert_eq!((files.len(), files.available()), (1, 2));
+    for index in [3, u32::MAX] {
+        let slot = liburing::UringFileSlot(index);
+        assert_eq!(files.get(slot), None);
+        assert!(matches!(
+            files.remove(slot),
+            Err(liburing::UringError::InvalidFileSlot(_))
+        ));
+    }
+    assert_eq!(files.insert(raw)?, liburing::UringFileSlot(0));
+    assert_eq!(files.insert(raw)?, liburing::UringFileSlot(2));
+    assert!(matches!(
+        files.insert(raw),
+        Err(liburing::UringError::FixedFileSlotsExhausted)
+    ));
+    let middle = liburing::UringFileSlot(1);
+    assert_eq!(files.remove(middle)?, raw);
+    assert!(matches!(
+        files.remove(middle),
+        Err(liburing::UringError::InvalidFileSlot(1))
+    ));
+    assert_eq!(files.available(), 1);
+    assert_eq!(files.insert(raw)?, middle);
+    files.unregister()?;
+    files.unregister()?;
+    assert!(files.insert(raw).is_err());
+    assert!(files.remove(middle).is_err());
+    assert_eq!((files.len(), files.available()), (0, 0));
     Ok(())
 }

@@ -546,6 +546,48 @@ mod unit_lifecycle_scenario {
     }
 
     #[test]
+    fn cancel_and_target_completion_orders_keep_reused_generation_isolated() -> Result<()> {
+        for cancel_first in [true, false] {
+            let pool = pool(1);
+            let mut waiting = pool.checkout()?.into_in_flight();
+            let id = waiting.id();
+            waiting.quarantine()?;
+            let mut replacement = None;
+            for target_final in [!cancel_first, cancel_first] {
+                if target_final {
+                    // SAFETY: No SQE is submitted in this unit state-machine
+                    // test; this event represents the target's own final CQE.
+                    unsafe { pool.reclaim_completed(id)? };
+                    replacement = Some(pool.checkout()?.into_in_flight());
+                } else {
+                    assert_eq!(pool.available(), 0);
+                    assert!(matches!(
+                        pool.checkout(),
+                        Err(UringError::FixedBuffersExhausted)
+                    ));
+                    assert!(matches!(
+                        pool.inner.slots[0].state.get(),
+                        State::Quarantined | State::InFlight
+                    ));
+                }
+            }
+            assert!(matches!(
+                waiting.quarantine(),
+                Err(UringError::BufferNotInFlight(_))
+            ));
+            drop(waiting);
+            assert_eq!(pool.inner.slots[0].state.get(), State::InFlight);
+            let replacement = replacement.ok_or(UringError::BufferNotInFlight(id.0))?;
+            // SAFETY: The replacement also remained in user space throughout;
+            // no kernel request or zero-copy notification can still access it.
+            drop(unsafe { replacement.complete()? });
+            assert_eq!(pool.available(), 1);
+            detach(&pool);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unregister_rejects_owned_and_quarantined_slots() -> Result<()> {
         let mut pool = pool(1);
         let checked_out = pool.checkout()?;
