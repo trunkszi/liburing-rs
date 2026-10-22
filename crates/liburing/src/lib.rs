@@ -11,6 +11,7 @@ pub mod id;
 pub mod ops;
 pub mod pbuf_ring;
 pub mod proactor;
+pub mod socket_bridge;
 pub mod subsystem;
 pub mod waker;
 
