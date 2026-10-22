@@ -189,12 +189,12 @@ struct Pending<Id> {
     cancel_requested: bool,
 }
 
-/// Bounded, single-flight readiness bridge bound to one subsystem.
+/// Single-flight readiness bridge with growing bookkeeping for one subsystem.
 ///
 /// The adapter and bridge must remain alive until every registered socket has
 /// completed close. Dropping this value does not cancel or close descriptors;
-/// the caller must drain operations before unregistering its handler. Capacity is
-/// allocated at construction; bridge transitions do not allocate.
+/// the caller must drain operations before unregistering its handler. Socket and
+/// operation bookkeeping grows on demand; transitions can allocate.
 pub struct UringSocketBridge<O: UringSocketOps> {
     subsystem: SubsystemId,
     ops: O,
@@ -204,7 +204,7 @@ pub struct UringSocketBridge<O: UringSocketOps> {
 }
 
 impl<O: UringSocketOps> UringSocketBridge<O> {
-    /// Binds an adapter and reserves bookkeeping for `socket_capacity` sockets.
+    /// Binds an adapter and reserves initial bookkeeping for `socket_capacity` sockets.
     ///
     /// # Errors
     /// Returns `WrongSubsystem` for a mismatched adapter and `Capacity` if the
@@ -252,7 +252,8 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
     /// The caller must keep the descriptor open until the bridge's final
     /// close CQE; closing it externally would invalidate the fd reuse barrier.
     /// # Errors
-    /// Rejects negative, duplicate, or excess descriptors.
+    /// Rejects negative or duplicate descriptors; returns `Capacity` if bookkeeping
+    /// cannot grow because of overflow or allocation failure.
     /// # Panics
     /// Never panics.
     pub fn register(&mut self, fd: RawFd) -> Result<(), BridgeError<O::Error>> {
@@ -262,12 +263,29 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
         if self.index(fd).is_some() {
             return Err(BridgeError::AlreadyRegistered);
         }
-        let slot = self
-            .sockets
-            .iter_mut()
-            .find(|socket| socket.is_none())
-            .ok_or(BridgeError::Capacity)?;
-        *slot = Some(Socket {
+        let slot = match self.sockets.iter().position(Option::is_none) {
+            Some(slot) => slot,
+            None => {
+                let old = self.sockets.len();
+                let capacity = if old == 0 {
+                    4
+                } else {
+                    old.checked_mul(2).ok_or(BridgeError::Capacity)?
+                };
+                let pending = capacity.checked_mul(6).ok_or(BridgeError::Capacity)?;
+                self.sockets
+                    .try_reserve(capacity - old)
+                    .map_err(|_| BridgeError::Capacity)?;
+                self.pending
+                    .try_reserve(pending.saturating_sub(self.pending.len()))
+                    .map_err(|_| BridgeError::Capacity)?;
+                self.sockets.resize_with(capacity, || None);
+                self.pending
+                    .resize_with(pending.max(self.pending.len()), || None);
+                old
+            }
+        };
+        self.sockets[slot] = Some(Socket {
             fd,
             interest: SocketInterest::EMPTY,
             closing: false,
@@ -279,8 +297,9 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
     /// A replacement poll waits for both the old target's final CQE and its
     /// removal control CQE. Multiple changes coalesce into the latest mask.
     /// # Errors
-    /// Rejects unknown or closing sockets. Submission failure leaves the desired
-    /// mask recorded; call `drive` to retry after restoring submission capacity.
+    /// Rejects unknown or closing sockets and bookkeeping allocation failures.
+    /// Submission failure leaves the desired mask recorded; call `drive` to retry
+    /// after restoring submission capacity.
     /// # Panics
     /// Never panics.
     pub fn set_interest(
@@ -303,7 +322,8 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
     /// that syscall before registering readiness, rather than call this method.
     /// # Errors
     /// Rejects unknown/closing sockets, duplicate connects, pending polls or poll
-    /// removals, and submission errors. Retire polling before calling connect.
+    /// removals, bookkeeping allocation failures, and submission errors. Retire
+    /// polling before calling connect.
     /// # Panics
     /// Never panics.
     pub fn connect(&mut self, fd: RawFd, address: SocketAddr) -> Result<(), BridgeError<O::Error>> {
@@ -333,8 +353,9 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
     /// Cancel control completions never retire their targets. Close is staged
     /// only once every target and control operation has delivered its final CQE.
     /// # Errors
-    /// Returns `UnknownFd` after final close or an adapter submission error.
-    /// Submission errors retain closing state for a subsequent `drive` retry.
+    /// Returns `UnknownFd` after final close, an adapter submission error, or
+    /// `Capacity` if bookkeeping cannot grow. Failures retain closing state for
+    /// a subsequent `drive` retry.
     /// # Panics
     /// Never panics.
     pub fn close(&mut self, fd: RawFd) -> Result<(), BridgeError<O::Error>> {
@@ -454,11 +475,18 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
         kind: BridgeOpKind,
         interest: SocketInterest,
     ) -> Result<(), BridgeError<O::Error>> {
-        let index = self
-            .pending
-            .iter()
-            .position(Option::is_none)
-            .ok_or(BridgeError::Capacity)?;
+        let index = match self.pending.iter().position(Option::is_none) {
+            Some(index) => index,
+            None => {
+                let old = self.pending.len();
+                let capacity = old.max(1).checked_mul(2).ok_or(BridgeError::Capacity)?;
+                self.pending
+                    .try_reserve(capacity - old)
+                    .map_err(|_| BridgeError::Capacity)?;
+                self.pending.resize_with(capacity, || None);
+                old
+            }
+        };
         let token = self.next_token;
         if token > OpPayload::MAX_RAW {
             return Err(BridgeError::SequenceExhausted);
@@ -564,237 +592,4 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
 }
 
 #[cfg(test)]
-mod unit_lifecycle_scenario {
-    use std::{
-        cell::{Cell, RefCell},
-        rc::Rc,
-    };
-
-    use super::*;
-
-    const SUBSYSTEM: SubsystemId = SubsystemId(9);
-    type Requests = Rc<RefCell<Vec<(u64, BridgeSubmission<u64>)>>>;
-
-    struct Recorder {
-        requests: Requests,
-        fail: Rc<Cell<bool>>,
-    }
-
-    impl UringSocketOps for Recorder {
-        type OpId = u64;
-        type Error = &'static str;
-        fn subsystem_id(&self) -> SubsystemId {
-            SUBSYSTEM
-        }
-        fn submit(&mut self, token: u64, op: BridgeSubmission<u64>) -> Result<u64, Self::Error> {
-            if self.fail.replace(false) {
-                return Err("queue full");
-            }
-            self.requests.borrow_mut().push((token, op));
-            Ok(token + 1024)
-        }
-    }
-
-    struct Harness {
-        bridge: UringSocketBridge<Recorder>,
-        requests: Requests,
-        fail: Rc<Cell<bool>>,
-    }
-
-    impl Harness {
-        fn new() -> Result<Self, BridgeError<&'static str>> {
-            let requests = Rc::new(RefCell::new(Vec::new()));
-            let fail = Rc::new(Cell::new(false));
-            let ops = Recorder {
-                requests: Rc::clone(&requests),
-                fail: Rc::clone(&fail),
-            };
-            Ok(Self {
-                bridge: UringSocketBridge::new(SUBSYSTEM, ops, 1)?,
-                requests,
-                fail,
-            })
-        }
-        fn token(&self, index: usize) -> u64 {
-            self.requests.borrow()[index].0
-        }
-        fn complete(&mut self, index: usize, result: i32) {
-            let token = self.token(index);
-            assert!(self.bridge.on_cqe(token, result, false).is_some());
-        }
-        fn count(&self) -> usize {
-            self.requests.borrow().len()
-        }
-    }
-    #[test]
-    fn interest_changes_wait_for_target_and_control_in_both_orders()
-    -> Result<(), BridgeError<&'static str>> {
-        for control_first in [false, true] {
-            let mut h = Harness::new()?;
-            h.bridge.register(7)?;
-            h.bridge.set_interest(7, SocketInterest::READABLE)?;
-            h.bridge.set_interest(7, SocketInterest::WRITABLE)?;
-            h.bridge
-                .set_interest(7, SocketInterest::READABLE | SocketInterest::WRITABLE)?;
-            assert_eq!(h.count(), 2);
-            assert_eq!(
-                h.requests.borrow()[1].1,
-                BridgeSubmission::PollRemove {
-                    fd: 7,
-                    target: h.token(0) + 1024
-                }
-            );
-            h.complete(1, -libc::ENOMEM);
-            h.bridge.drive()?;
-            assert_eq!(h.count(), 3);
-            h.complete(
-                if control_first { 2 } else { 0 },
-                if control_first { 0 } else { -125 },
-            );
-            h.bridge.drive()?;
-            assert_eq!(h.count(), 3);
-            h.complete(
-                if control_first { 0 } else { 2 },
-                if control_first { -125 } else { 0 },
-            );
-            h.bridge.drive()?;
-            assert_eq!(h.count(), 4);
-            assert_eq!(
-                h.requests.borrow()[3].1,
-                BridgeSubmission::PollAdd {
-                    fd: 7,
-                    interest: SocketInterest::READABLE | SocketInterest::WRITABLE,
-                }
-            );
-        }
-        Ok(())
-    }
-    #[test]
-    fn close_drains_poll_and_controls_before_fd_reuse() -> Result<(), BridgeError<&'static str>> {
-        for control_first in [false, true] {
-            let mut h = Harness::new()?;
-            h.bridge.register(7)?;
-            h.bridge.set_interest(7, SocketInterest::READABLE)?;
-            h.bridge.set_interest(7, SocketInterest::WRITABLE)?;
-            h.bridge.close(7)?;
-            h.bridge.close(7)?;
-            assert_eq!(h.count(), 3);
-            h.complete(2, -libc::ENOMEM);
-            h.bridge.drive()?;
-            assert_eq!(h.count(), 4);
-            assert_eq!(
-                h.requests.borrow()[3].1,
-                BridgeSubmission::Cancel {
-                    fd: 7,
-                    target: h.token(0) + 1024
-                }
-            );
-            assert_eq!(
-                h.bridge.set_interest(7, SocketInterest::WRITABLE),
-                Err(BridgeError::Closing)
-            );
-            let order = if control_first { [1, 3, 0] } else { [0, 1, 3] };
-            for (position, index) in order.into_iter().enumerate() {
-                h.complete(index, if index == 0 { -libc::ECANCELED } else { 0 });
-                h.bridge.drive()?;
-                assert_eq!(h.count(), if position == 2 { 5 } else { 4 });
-            }
-            assert_eq!(h.requests.borrow()[4].1, BridgeSubmission::Close { fd: 7 });
-            assert_eq!(h.bridge.register(7), Err(BridgeError::AlreadyRegistered));
-            h.complete(4, 0);
-            h.bridge.register(7)?;
-            h.bridge.set_interest(7, SocketInterest::READABLE)?;
-            assert_eq!(h.bridge.on_cqe(h.token(0), 1, false), None);
-            assert_eq!(h.count(), 6);
-        }
-        Ok(())
-    }
-    #[test]
-    fn connect_waits_for_poll_target_and_control() -> Result<(), BridgeError<&'static str>> {
-        for control_first in [false, true] {
-            let mut h = Harness::new()?;
-            let address = SocketAddr::from(([127, 0, 0, 1], 80));
-            h.bridge.register(7)?;
-            h.bridge.set_interest(7, SocketInterest::READABLE)?;
-            assert_eq!(h.bridge.connect(7, address), Err(BridgeError::PollInFlight));
-            assert_eq!(h.count(), 1);
-            h.bridge.set_interest(7, SocketInterest::EMPTY)?;
-            h.complete(if control_first { 1 } else { 0 }, 0);
-            assert_eq!(h.bridge.connect(7, address), Err(BridgeError::PollInFlight));
-            assert_eq!(h.count(), 2);
-            h.complete(if control_first { 0 } else { 1 }, 0);
-            h.bridge.connect(7, address)?;
-            assert_eq!(h.token(2), 3, "rejections must not consume tokens");
-            assert_eq!(
-                h.bridge.connect(7, address),
-                Err(BridgeError::ConnectInFlight)
-            );
-            h.bridge.close(7)?;
-            assert_eq!(
-                h.requests.borrow()[3].1,
-                BridgeSubmission::Cancel {
-                    fd: 7,
-                    target: h.token(2) + 1024
-                }
-            );
-            for index in if control_first { [3, 2] } else { [2, 3] } {
-                h.complete(index, if index == 2 { -libc::ECANCELED } else { 0 });
-                h.bridge.drive()?;
-            }
-            assert_eq!(h.requests.borrow()[4].1, BridgeSubmission::Close { fd: 7 });
-            h.complete(4, 0);
-        }
-        Ok(())
-    }
-    #[test]
-    fn failed_submission_keeps_interest_and_close_for_retry()
-    -> Result<(), BridgeError<&'static str>> {
-        let mut h = Harness::new()?;
-        h.bridge.register(7)?;
-        h.fail.set(true);
-        assert_eq!(
-            h.bridge.set_interest(7, SocketInterest::READABLE),
-            Err(BridgeError::Submission("queue full"))
-        );
-        h.bridge.drive()?;
-        assert_eq!(h.token(0), 1);
-        h.bridge.close(7)?;
-        h.complete(1, -libc::ENOMEM);
-        h.bridge.drive()?;
-        assert_eq!(h.count(), 3, "failed cancellation must be retried");
-        h.complete(2, -libc::ENOENT);
-        h.bridge.drive()?;
-        assert_eq!(h.count(), 3);
-        h.complete(0, -125);
-        h.fail.set(true);
-        assert_eq!(h.bridge.drive(), Err(BridgeError::Submission("queue full")));
-        h.bridge.drive()?;
-        h.complete(3, -libc::ECANCELED);
-        h.bridge.drive()?;
-        assert_eq!(h.count(), 5);
-        h.complete(4, -5);
-        h.bridge.drive()?;
-        assert_eq!(h.count(), 5);
-        h.bridge.register(7)?;
-        Ok(())
-    }
-    #[test]
-    fn sequence_exhaustion_rejects_aliasing_and_capacity_rejects_extra_fds()
-    -> Result<(), BridgeError<&'static str>> {
-        let mut h = Harness::new()?;
-        assert_eq!(h.bridge.register(-1), Err(BridgeError::InvalidFd));
-        h.bridge.register(7)?;
-        assert_eq!(h.bridge.register(8), Err(BridgeError::Capacity));
-        assert_eq!(
-            h.bridge.set_interest(8, SocketInterest::READABLE),
-            Err(BridgeError::UnknownFd)
-        );
-        h.bridge.next_token = OpPayload::MAX_RAW;
-        h.bridge.set_interest(7, SocketInterest::READABLE)?;
-        assert_eq!(h.token(0), OpPayload::MAX_RAW);
-        h.complete(0, 1);
-        assert_eq!(h.bridge.drive(), Err(BridgeError::SequenceExhausted));
-        assert_eq!(h.count(), 1);
-        Ok(())
-    }
-}
+mod tests;

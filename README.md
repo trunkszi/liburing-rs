@@ -104,6 +104,8 @@ Nested submission and completion dispatch are rejected with
 Linked SQEs (`IOSQE_IO_LINK` and `IOSQE_IO_HARDLINK`) are rejected with
 `UringError::InvalidPreparedSqe`: bounded staging can split submissions across
 kernel batches and does not preserve link-chain atomicity.
+`IOSQE_IO_DRAIN` is also rejected, since it can wait indefinitely for the
+proactor's persistent internal eventfd poll to complete.
 
 `tick` submits and performs a nonblocking completion batch. `wait_completions`
 submits and waits for a minimum completion count or relative timeout. The
@@ -112,6 +114,22 @@ than one kernel SQ's worth of operations when staging capacity allows, without
 recursive `io_uring_submit` calls.
 
 ## DMA Isolation and Provided Buffers
+
+`FixedFileTable::grow(min_capacity)` doubles its current capacity or reaches the
+requested minimum while preserving every occupied slot index. `insert` grows a
+full table automatically. Growth replaces the kernel registration and should run
+on the control plane after prior fixed-file operations retire; unregistration can
+wait for outstanding I/O. Bookkeeping allocation precedes kernel replacement. A
+failed replacement attempts to restore the original table; failed restoration
+marks the table unregistered so later slot operations fail consistently.
+
+Each occupied fixed-file slot retains a private close-on-exec duplicate in
+addition to the kernel reference. This preserves the registered file's identity
+across growth even after the caller closes or reuses its original descriptor.
+Public slot lookups still report the original descriptor number. Removing a slot,
+reclaiming its direct close, or unregistering the table releases the duplicate;
+the caller retains ownership of its own descriptor. Duplication and growth may
+fail due to OS descriptor limits, kernel registration limits, or allocation errors.
 
 Preparing an SQE does not transfer arbitrary raw-pointer lifetimes to `Proactor`.
 The submitter must keep buffers, addresses, message headers, and descriptors valid
@@ -156,6 +174,13 @@ receive selecting that group.
 `SocketInterest` contains `READABLE` and `WRITABLE`; `UringSocketOps` supplies the
 operation-staging boundary. `BridgeOpKind` distinguishes `PollAdd`, `PollRemove`,
 `Cancel`, `Connect`, and `Close`.
+
+The socket capacity supplied at construction is an initial reservation, not a
+registration limit. Registering beyond it doubles socket bookkeeping (zero grows
+to four slots) and reserves at least six pending operations per socket. Pending
+operation bookkeeping also doubles independently when full, preserving live
+tokens and indices. These control-plane transitions can allocate and return
+`BridgeError::Capacity` on allocation failure or capacity overflow.
 
 The bridge maintains a single active `POLL_ADD` per socket generation. Interest
 changes remove the old poll before installing its replacement. Close cancels

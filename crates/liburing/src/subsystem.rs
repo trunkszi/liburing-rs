@@ -25,6 +25,11 @@ pub(crate) struct StagedSqe {
 }
 
 pub(crate) fn validate_prepared_sqe(sqe: &io_uring_sqe) -> Result<()> {
+    if u32::from(sqe.flags) & liburing_sys::IOSQE_IO_DRAIN != 0 {
+        return Err(UringError::InvalidPreparedSqe(
+            "drain operations can wait forever on the internal wakeup poll",
+        ));
+    }
     if u32::from(sqe.flags) & (liburing_sys::IOSQE_IO_LINK | liburing_sys::IOSQE_IO_HARDLINK) != 0 {
         return Err(UringError::InvalidPreparedSqe(
             "linked operations cannot preserve chains across staged submissions",
@@ -71,6 +76,8 @@ impl<'a> SubmissionContext<'a> {
     /// Rejects operations that skip final CQEs or inject message-ring CQEs, and
     /// returns `InvalidPreparedSqe` for linked operations because staged
     /// submissions cannot preserve chains across kernel submission batches.
+    /// `IOSQE_IO_DRAIN` also returns `InvalidPreparedSqe`: the internal wakeup
+    /// poll can remain outstanding indefinitely.
     ///
     /// # Panics
     /// Propagates a panic from `prepare`; the operation is not staged.
@@ -282,6 +289,28 @@ mod unit_scenario_tests {
                     "linked operations cannot preserve chains across staged submissions"
                 ))
             );
+            assert_eq!(context.remaining_capacity(), 1);
+        }
+        context.prepare_sqe_with(op_id, |_| {})?;
+        assert_eq!(context.remaining_capacity(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn staging_rejects_drain_flags_without_consuming_capacity() -> Result<()> {
+        let mut staged = VecDeque::with_capacity(1);
+        let mut context = SubmissionContext::new(&mut staged, 1);
+        let op_id = completion(1, 1).op_id;
+        for flags in [
+            liburing_sys::IOSQE_IO_DRAIN,
+            liburing_sys::IOSQE_IO_DRAIN | liburing_sys::IOSQE_IO_LINK,
+            liburing_sys::IOSQE_IO_DRAIN | liburing_sys::IOSQE_IO_HARDLINK,
+        ] {
+            let result = context.prepare_sqe_with(op_id, |sqe| {
+                // SAFETY: The callback exclusively borrows an initialized SQE.
+                unsafe { (*sqe).flags = flags as u8 };
+            });
+            assert!(matches!(result, Err(UringError::InvalidPreparedSqe(_))));
             assert_eq!(context.remaining_capacity(), 1);
         }
         context.prepare_sqe_with(op_id, |_| {})?;
