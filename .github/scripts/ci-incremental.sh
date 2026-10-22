@@ -7,13 +7,18 @@ base="${1:-HEAD~1}"
 if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
   base=HEAD
 fi
-changed="$(git diff --name-only "$base...HEAD"; git diff --name-only; git diff --cached --name-only; git ls-files --others --exclude-standard)"
+committed_changes="$(git diff --name-only "$base...HEAD")"
+working_changes="$(git diff --name-only)"
+staged_changes="$(git diff --cached --name-only)"
+untracked_changes="$(git ls-files --others --exclude-standard)"
+changed="$(printf '%s\n' "$committed_changes" "$working_changes" "$staged_changes" "$untracked_changes")"
 if [ "$base" = "$(git rev-parse HEAD)" ] || [ "$base" = HEAD ]; then
   changed="$(git ls-files --cached --others --exclude-standard)"
 fi
 
 python3 - <<'PY'
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tomllib
@@ -23,25 +28,56 @@ paths = subprocess.check_output(
 ).decode().split('\0')
 errors = []
 source_suffixes = {'.rs', '.c', '.h', '.cpp', '.hpp'}
-text_suffixes = source_suffixes | {'.sh', '.toml', '.yml', '.yaml'}
+text_suffixes = source_suffixes | {'.sh', '.toml', '.yml', '.yaml', '.md', '.txt'}
 for name in sorted(set(paths) - {''}):
     path = Path(name)
-    if not path.is_file() or '.scratch' in path.parts:
+    if '.scratch' in path.parts:
+        errors.append(f'{name}: scratch artifacts must remain untracked')
         continue
-    if path.suffix not in text_suffixes:
+    if not path.is_file():
         continue
-    content = path.read_text()
+    try:
+        content = path.read_text()
+    except UnicodeDecodeError:
+        if path.suffix in text_suffixes or path.name in {'Cargo.lock', 'LICENSE', '.gitignore'}:
+            errors.append(f'{name}: text must use UTF-8')
+        continue
     if path.suffix in source_suffixes and len(content.splitlines()) > 800:
         errors.append(f'{name}: exceeds 800 lines')
     if ''.join(map(chr, (104, 102, 116))) in content.lower():
         errors.append(f'{name}: forbidden vocabulary')
-    if any(0x2E80 <= ord(c) <= 0xA4CF or 0xAC00 <= ord(c) <= 0xD7AF
-           or 0xF900 <= ord(c) <= 0xFAFF or 0xFF65 <= ord(c) <= 0xFFDC
-           or 0x20000 <= ord(c) <= 0x323AF for c in content):
+    ranges = ((0x1100, 0x11FF), (0x2E80, 0xA4CF), (0xA960, 0xA97F),
+              (0xAC00, 0xD7FF), (0xF900, 0xFAFF), (0xFE30, 0xFE4F),
+              (0xFF65, 0xFFDC), (0x16FE0, 0x18DFF), (0x1AFF0, 0x1AFFF),
+              (0x1B000, 0x1B16F), (0x20000, 0x323AF))
+    if any(low <= ord(c) <= high for c in content for low, high in ranges):
         errors.append(f'{name}: source text must use English')
     if path.name != 'Cargo.toml':
         continue
     document = tomllib.loads(content)
+    in_dependencies = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith('['):
+            header = stripped
+            section = tomllib.loads(header + '\n__ci_section = true')
+            keys = []
+            while '__ci_section' not in section:
+                key, section = next(iter(section.items()))
+                keys.append(key)
+                if isinstance(section, list):
+                    section = section[0]
+            dependency_sections = [index for index, key in enumerate(keys)
+                                   if key in {'dependencies', 'dev-dependencies', 'build-dependencies'}]
+            if dependency_sections and dependency_sections[-1] != len(keys) - 1:
+                errors.append(f'{name}: dependency subtable must use an inline table')
+            in_dependencies = bool(dependency_sections) and dependency_sections[-1] == len(keys) - 1
+        elif in_dependencies:
+            assignment = r"^\s*(?:[A-Za-z0-9_-]+|\"(?:[^\"\\]|\\.)*\"|'[^']*')\s*=\s*\{"
+            if not re.match(assignment, line):
+                errors.append(f'{name}: dependency must use an inline table')
 
     def visit(table):
         for key, value in table.items():
@@ -78,14 +114,15 @@ while IFS= read -r file; do
 done <<< "$changed"
 
 metadata="$(cargo metadata --no-deps --format-version 1)"
-mapfile -t packages < <(python3 -c '
+package_names="$(python3 -c '
 import json, sys
 metadata = json.load(sys.stdin)
 members = set(metadata["workspace_members"])
 for package in metadata["packages"]:
     if package["id"] in members:
         print(package["name"])
-' <<< "$metadata")
+' <<< "$metadata")"
+mapfile -t packages <<< "$package_names"
 selected=()
 for package in "${packages[@]}"; do
   if [ "$run_all" -eq 1 ] || [ -n "${affected[$package]:-}" ]; then

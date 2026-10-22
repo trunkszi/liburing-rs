@@ -2,7 +2,9 @@
 //! Kernel operations require an environment that permits io_uring_setup.
 
 use std::{
+    io::Write,
     mem::{MaybeUninit, align_of, offset_of, size_of},
+    os::{fd::AsRawFd, unix::net::UnixStream},
     ptr,
 };
 
@@ -259,6 +261,8 @@ fn integration_scenario_timeout_completion_preserves_user_data() {
 #[test]
 fn integration_lifecycle_provided_buffer_ring_helpers() {
     let mut ring = Ring::new();
+    let (mut sender, receiver) = UnixStream::pair().expect("create local socket pair");
+    sender.write_all(b"hello").expect("write peer payload");
     let mut error = 0;
     let mut payload = [0_u8; 64];
     // SAFETY: The ring is live; the helper allocates storage for eight entries and registers it.
@@ -280,6 +284,19 @@ fn integration_lifecycle_provided_buffer_ring_helpers() {
             .add(uring_shim_offsetof_io_uring_buf_ring_tail())
             .cast::<u16>();
         assert_eq!(tail.read_volatile(), 1);
+        let sqe = ring.sqe();
+        uring_shim_prep_recv(sqe, receiver.as_raw_fd(), ptr::null_mut(), payload.len(), 0);
+        uring_shim_sqe_set_flags(sqe, IOSQE_BUFFER_SELECT);
+        uring_shim_sqe_set_buf_group(sqe, 7);
+        uring_shim_sqe_set_data64(sqe, 0x1122);
+        assert_eq!(uring_shim_submit(&mut ring.0), 1);
+        let cqe = ring.completion();
+        assert_eq!((*cqe).res, 5);
+        assert_eq!(uring_shim_cqe_get_data64(cqe), 0x1122);
+        assert_ne!((*cqe).flags & IORING_CQE_F_BUFFER, 0);
+        assert_eq!((*cqe).flags >> IORING_CQE_BUFFER_SHIFT, 42);
+        uring_shim_cqe_seen(&mut ring.0, cqe);
+        assert_eq!(&payload[..5], b"hello");
         let result = uring_shim_free_buf_ring(&mut ring.0, br, 8, 7);
         assert_eq!(result, 0, "buffer ring teardown failed: {result}");
     }
