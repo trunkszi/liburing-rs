@@ -24,6 +24,20 @@ pub(crate) struct StagedSqe {
     pub(crate) sqe: io_uring_sqe,
 }
 
+pub(crate) fn validate_prepared_sqe(sqe: &io_uring_sqe) -> Result<()> {
+    if u32::from(sqe.flags) & liburing_sys::IOSQE_CQE_SKIP_SUCCESS != 0 {
+        return Err(UringError::InvalidConfig(
+            "operations must produce their final completion",
+        ));
+    }
+    if u32::from(sqe.opcode) == liburing_sys::IORING_OP_MSG_RING {
+        return Err(UringError::InvalidConfig(
+            "message-ring completions bypass operation accounting",
+        ));
+    }
+    Ok(())
+}
+
 /// A callback's bounded submission capability, without access to the ring.
 ///
 /// SQEs enter an already allocated queue and cannot be submitted to the kernel
@@ -49,6 +63,7 @@ impl<'a> SubmissionContext<'a> {
     /// has reached its fixed capacity. Rejects the internal subsystem with
     /// `InvalidSubsystemId` and the all-ones fallback timeout sentinel with
     /// `InvalidPayload`.
+    /// Rejects operations that skip final CQEs or inject message-ring CQEs.
     ///
     /// # Panics
     /// Propagates a panic from `prepare`; the operation is not staged.
@@ -69,6 +84,7 @@ impl<'a> SubmissionContext<'a> {
         // representations are valid; preparation fills opcode-specific fields.
         let mut sqe = unsafe { core::mem::zeroed::<io_uring_sqe>() };
         prepare(&raw mut sqe);
+        validate_prepared_sqe(&sqe)?;
         sqe.user_data = op_id.raw();
         self.staged.push_back(StagedSqe { sqe });
         Ok(())

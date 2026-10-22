@@ -13,12 +13,12 @@ pre-release = ["liburing-sys/pre-release"]
 stable = ["liburing-sys/stable"]
 
 [dependencies]
-liburing-sys.workspace = true
-libc.workspace = true
-thiserror.workspace = true
+liburing-sys = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-static_assertions.workspace = true
+static_assertions = { workspace = true }
 
 [lints]
 workspace = true

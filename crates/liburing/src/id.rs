@@ -196,19 +196,20 @@ pub trait OpPayloadCodec: Sized {
 
 #[cfg(test)]
 mod unit {
-    use super::{OpId, OpPayload, SubsystemId};
+    use super::{OpId, OpPayload, SubsystemId, UringError};
 
     #[test]
-    fn every_routing_byte_preserves_payload_boundaries() {
+    fn every_routing_byte_preserves_payload_boundaries() -> Result<(), UringError> {
         for route in 0..=u8::MAX {
             for raw in [0, 1, 0x0023_4567_89ab_cdef, OpPayload::MAX_RAW] {
-                let payload = OpPayload::new(raw).expect("test payload fits 56 bits");
+                let payload = OpPayload::new(raw).ok_or(UringError::InvalidPayload(raw))?;
                 let subsystem = SubsystemId::new_unchecked(route);
                 let packed = OpId::pack(subsystem, payload);
                 assert_eq!(packed.unpack(), (subsystem, payload));
                 assert_eq!(OpId::from_raw(packed.raw()), packed);
             }
         }
+        Ok(())
     }
 
     #[test]
