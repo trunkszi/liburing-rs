@@ -21,6 +21,10 @@ mod subsystems;
 /// occupies 8 bits, `u16` occupies 16, and `u32` occupies 32. Fieldless enums
 /// store their integer discriminant. Enums that carry fields use a dense tag
 /// in the low bits, then that variant's fields.
+/// Fields accept unqualified primitive names or paths through
+/// `core::primitive` and `std::primitive`. The resolved type must match the
+/// corresponding unsigned primitive; a shadowing alias to a wider or signed
+/// type is rejected.
 ///
 /// ```
 /// use liburing_macros::OpPayloadCodec;
@@ -51,10 +55,59 @@ mod subsystems;
 /// }
 /// ```
 ///
+/// A variant tag counts toward the 56-bit limit.
+///
+/// ```compile_fail
+/// use liburing_macros::OpPayloadCodec;
+///
+/// #[derive(OpPayloadCodec)]
+/// enum TooWideWithTag {
+///     Empty,
+///     Fields { raw: u8, body: u16, tag: u32 },
+/// }
+/// ```
+///
+/// Primitive-looking aliases cannot supply a different field width.
+///
+/// ```compile_fail
+/// use liburing_macros::OpPayloadCodec;
+///
+/// #[allow(non_camel_case_types)]
+/// type u8 = u64;
+///
+/// #[derive(OpPayloadCodec)]
+/// struct WiderAlias { value: u8 }
+/// ```
+///
+/// ```compile_fail
+/// use liburing_macros::OpPayloadCodec;
+///
+/// #[allow(non_camel_case_types)]
+/// mod protocol {
+///     pub type u8 = u64;
+/// }
+///
+/// #[derive(OpPayloadCodec)]
+/// struct QualifiedAlias { value: protocol::u8 }
+/// ```
+///
+/// Signed aliases are rejected even when their storage size matches.
+///
+/// ```compile_fail
+/// use liburing_macros::OpPayloadCodec;
+///
+/// #[allow(non_camel_case_types)]
+/// type u8 = i8;
+///
+/// #[derive(OpPayloadCodec)]
+/// struct SignedAlias { value: u8 }
+/// ```
+///
 /// # Errors
 ///
 /// Expansion fails when the input is not a struct or enum, when the type has
-/// generics, when a field is not `u8`, `u16`, or `u32`, when a fieldless
+/// generics, when a field does not name and resolve to `u8`, `u16`, or `u32`
+/// through one of the accepted paths, when a fieldless
 /// discriminant is negative, non-literal, or wider than 56 bits, or when the
 /// packed width exceeds 56 bits.
 ///
@@ -72,6 +125,8 @@ pub fn derive_op_payload_codec(input: TokenStream) -> TokenStream {
 /// The macro emits `id`, `from_id`, `ALL`, `register_all`, `From<Self> for u8`,
 /// and `TryFrom<u8>`. Discriminants must be unique integer literals. Zero is
 /// rejected because the proactor reserves it for its waker and timer.
+/// `cfg` and `cfg_attr` attributes on the enum or its variants are rejected.
+/// Apply conditional compilation to the entire macro invocation instead.
 ///
 /// ```
 /// use liburing_macros::define_subsystems;
@@ -118,12 +173,53 @@ pub fn derive_op_payload_codec(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     #[cfg(any())]
+///     enum ConditionalEnum { Dns = 1 }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     enum ConditionalVariant {
+///         Always = 1,
+///         #[cfg(any())]
+///         Disabled = 2,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     #[cfg_attr(all(), doc = "Conditional attributes are unsupported.")]
+///     enum ConditionalEnumAttribute { Dns = 1 }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     enum ConditionalVariantAttribute {
+///         #[cfg_attr(all(), doc = "Conditional attributes are unsupported.")]
+///         Dns = 1,
+///     }
+/// }
+/// ```
+///
 /// # Errors
 ///
 /// Expansion fails when the input is not a fieldless enum, when a discriminant
 /// is missing or not an integer literal, when an id is `0` or greater than
 /// 255, when two variants share an id, or when the caller supplies `derive` or
-/// `repr` attributes.
+/// `repr` attributes, or `cfg`/`cfg_attr` attributes on the enum or its variants.
 ///
 /// # Panics
 ///

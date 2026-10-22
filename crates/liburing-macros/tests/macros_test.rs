@@ -14,6 +14,49 @@ struct Kind(u8);
 struct Marker;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+struct NamedFields {
+    raw: u8,
+    body: u16,
+    tag: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+struct InternalNames {
+    __uring_payload_raw: u8,
+    __uring_payload_body: u8,
+    __uring_payload_tag: u8,
+    __uring_payload_field_0: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+enum NamedVariants {
+    Empty,
+    Fields {
+        raw: u8,
+        body: u16,
+        tag: u16,
+    },
+    Internal {
+        __uring_payload_raw: u8,
+        __uring_payload_body: u8,
+        __uring_payload_tag: u8,
+        __uring_payload_field_0: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+enum SingleWideVariant {
+    Fields { raw: u8, body: u16, tag: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+struct QualifiedPrimitives {
+    raw: core::primitive::u8,
+    body: std::primitive::u16,
+    tag: ::core::primitive::u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
 enum Opcode {
     Read = 1,
     Write = 2,
@@ -65,6 +108,118 @@ fn struct_roundtrip_covers_56bit_boundary() {
     let overflow = 0x00FF_FFFF_FFFF_FFFF + 1;
     assert_eq!(Header::decode_payload(overflow), Err(overflow));
     assert_eq!(Header::decode_payload(u64::MAX), Err(u64::MAX));
+}
+
+#[test]
+fn unit_named_fields_preserve_all_56_payload_bits() {
+    let value = NamedFields {
+        raw: 0xA5,
+        body: 0x1234,
+        tag: 0x5678_9ABC,
+    };
+    assert_eq!(NamedFields::PAYLOAD_BITS, 56);
+    let encoded = 0x0056_789A_BC12_34A5;
+    assert_eq!(value.encode_payload(), encoded);
+    assert_eq!(NamedFields::decode_payload(encoded), Ok(value));
+    let max = NamedFields {
+        raw: u8::MAX,
+        body: u16::MAX,
+        tag: u32::MAX,
+    };
+    assert_eq!(max.encode_payload(), 0x00FF_FFFF_FFFF_FFFF);
+    assert_eq!(NamedFields::decode_payload(max.encode_payload()), Ok(max));
+    assert_eq!(NamedFields::decode_payload(1_u64 << 56), Err(1_u64 << 56));
+}
+
+#[test]
+fn unit_internal_name_fields_preserve_source_values() {
+    let value = InternalNames {
+        __uring_payload_raw: 0x12,
+        __uring_payload_body: 0x34,
+        __uring_payload_tag: 0x56,
+        __uring_payload_field_0: 0x78,
+    };
+    assert_eq!(value.encode_payload(), 0x7856_3412);
+    assert_eq!(InternalNames::decode_payload(0x7856_3412), Ok(value));
+}
+
+#[test]
+fn unit_named_variants_preserve_fields_and_dense_tag() {
+    let value = NamedVariants::Fields {
+        raw: 0xAB,
+        body: 0xCDEF,
+        tag: 0x1234,
+    };
+    assert_eq!(NamedVariants::PAYLOAD_BITS, 42);
+    let encoded = 1_u64 | (0xAB_u64 << 2) | (0xCDEF_u64 << 10) | (0x1234_u64 << 26);
+    assert_eq!(value.encode_payload(), encoded);
+    assert_eq!(NamedVariants::decode_payload(encoded), Ok(value));
+    let internal = NamedVariants::Internal {
+        __uring_payload_raw: 0x12,
+        __uring_payload_body: 0x34,
+        __uring_payload_tag: 0x56,
+        __uring_payload_field_0: 0x78,
+    };
+    let internal_encoded = 2_u64 | (0x7856_3412_u64 << 2);
+    assert_eq!(internal.encode_payload(), internal_encoded);
+    assert_eq!(
+        NamedVariants::decode_payload(internal_encoded),
+        Ok(internal)
+    );
+    assert_eq!(NamedVariants::decode_payload(0), Ok(NamedVariants::Empty));
+    assert_eq!(NamedVariants::decode_payload(3), Err(3));
+    assert_eq!(NamedVariants::decode_payload(4), Err(4));
+    let stray = internal_encoded | (1_u64 << 34);
+    assert_eq!(NamedVariants::decode_payload(stray), Err(stray));
+}
+
+#[test]
+fn unit_single_variant_uses_all_56_bits_without_tag() {
+    let value = SingleWideVariant::Fields {
+        raw: u8::MAX,
+        body: u16::MAX,
+        tag: u32::MAX,
+    };
+    assert_eq!(SingleWideVariant::PAYLOAD_BITS, 56);
+    assert_eq!(value.encode_payload(), 0x00FF_FFFF_FFFF_FFFF);
+    assert_eq!(
+        SingleWideVariant::decode_payload(value.encode_payload()),
+        Ok(value)
+    );
+    assert_eq!(
+        SingleWideVariant::decode_payload(1_u64 << 56),
+        Err(1_u64 << 56)
+    );
+}
+
+#[test]
+fn unit_qualified_primitive_paths_preserve_56bit_layout() {
+    let value = QualifiedPrimitives {
+        raw: u8::MAX,
+        body: u16::MAX,
+        tag: u32::MAX,
+    };
+    assert_eq!(QualifiedPrimitives::PAYLOAD_BITS, 56);
+    assert_eq!(value.encode_payload(), 0x00FF_FFFF_FFFF_FFFF);
+    assert_eq!(
+        QualifiedPrimitives::decode_payload(value.encode_payload()),
+        Ok(value)
+    );
+}
+
+#[test]
+fn unit_primitive_checks_do_not_capture_caller_constants() {
+    #[allow(non_upper_case_globals)]
+    const value: u8 = 7;
+
+    #[derive(Debug, PartialEq, Eq, OpPayloadCodec)]
+    struct Payload {
+        raw: u8,
+    }
+
+    let expected = Payload { raw: value };
+    assert_eq!(expected.encode_payload(), 7);
+    assert_eq!(Payload::decode_payload(7), Ok(expected));
 }
 
 #[test]
