@@ -501,11 +501,9 @@ fn tagged_decode(tag_bits: u32, variants: &[TaggedArm]) -> TokenStream {
             let body = raw >> #tag_bits;
         }
     };
-    let wildcard = if tag_bits == 0 {
-        TokenStream::new()
-    } else {
-        quote! { _ => core::result::Result::Err(raw), }
-    };
+    // `tag` is a `u64` even when the only variant forces the value to 0.
+    // Rust does not narrow that binding, so the wildcard stays for exhaustiveness.
+    let wildcard = quote! { _ => core::result::Result::Err(raw), };
     quote! {
         if raw > 0x00FF_FFFF_FFFF_FFFFu64 {
             return core::result::Result::Err(raw);
