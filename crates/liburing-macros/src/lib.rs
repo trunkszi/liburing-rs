@@ -124,7 +124,9 @@ pub fn derive_op_payload_codec(input: TokenStream) -> TokenStream {
 ///
 /// The macro emits `id`, `from_id`, `ALL`, `register_all`, `From<Self> for u8`,
 /// and `TryFrom<u8>`. Discriminants must be unique integer literals. Zero is
-/// rejected because the proactor reserves it for its waker and timer.
+/// rejected because the proactor reserves it for its waker and timer. Variant
+/// names `ALL`, `id`, `from_id`, `register_all`, and `try_from` are reserved
+/// for the generated routing API, including their raw identifier spellings.
 /// `cfg` and `cfg_attr` attributes on the enum or its variants are rejected.
 /// Apply conditional compilation to the entire macro invocation instead.
 ///
@@ -214,12 +216,29 @@ pub fn derive_op_payload_codec(input: TokenStream) -> TokenStream {
 /// }
 /// ```
 ///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     enum HiddenRoutingTable { ALL = 1 }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use liburing_macros::define_subsystems;
+///
+/// define_subsystems! {
+///     enum HiddenConversion { r#from_id = 1 }
+/// }
+/// ```
+///
 /// # Errors
 ///
 /// Expansion fails when the input is not a fieldless enum, when a discriminant
 /// is missing or not an integer literal, when an id is `0` or greater than
 /// 255, when two variants share an id, or when the caller supplies `derive` or
 /// `repr` attributes, or `cfg`/`cfg_attr` attributes on the enum or its variants.
+/// Variant names reserved for the generated routing API are also rejected.
 ///
 /// # Panics
 ///
