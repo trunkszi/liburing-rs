@@ -133,6 +133,21 @@ fn data_enum_packs_tag_then_fields() {
     assert_eq!(Msg::decode_payload(high), Err(high));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, OpPayloadCodec)]
+enum Solo {
+    Value(u8),
+}
+
+#[test]
+fn single_variant_data_enum_roundtrip() {
+    assert_eq!(Solo::PAYLOAD_BITS, 8);
+    assert_eq!(Solo::Value(0x5A).encode_payload(), 0x5A);
+    assert_eq!(Solo::decode_payload(0x5A), Ok(Solo::Value(0x5A)));
+    assert_eq!(Solo::decode_payload(0x100), Err(0x100));
+    let high = 1_u64 << 56;
+    assert_eq!(Solo::decode_payload(high), Err(high));
+}
+
 #[test]
 fn subsystem_ids_roundtrip_and_register_in_order() {
     const _: () = assert!(MySubsystems::Dns.id() == 1);
