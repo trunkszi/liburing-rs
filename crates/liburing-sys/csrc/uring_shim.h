@@ -10,6 +10,16 @@
 extern "C" {
 #endif
 
+/*
+ * Pointer and lifecycle requirements are identical to upstream liburing.
+ * Dereferenced pointers must be aligned and valid for the required range.
+ * Ring initialization must succeed before ring operations or queue_exit.
+ * Serialize application ring access and retain request memory until the
+ * target operation's final completion, including after cancel completion.
+ * Consume CQE contents before cqe_seen/cq_advance releases their slots.
+ * Null is accepted only where the upstream function explicitly supports it.
+ */
+
 int uring_shim_queue_init_params(
     unsigned entries,
     struct io_uring *ring,
@@ -207,6 +217,11 @@ int uring_shim_free_buf_ring(
 
 void uring_shim_buf_ring_init(struct io_uring_buf_ring *br);
 
+/*
+ * br must contain a complete power-of-two entry array, mask must equal
+ * entries - 1, and the selected slot must be owned by the application.
+ * The buffer remains valid until its consuming operation completes.
+ */
 void uring_shim_buf_ring_add(
     struct io_uring_buf_ring *br,
     void *addr,
@@ -215,6 +230,7 @@ void uring_shim_buf_ring_add(
     int mask,
     int buf_offset);
 
+/* Publish exactly count newly initialized entries with a release store. */
 void uring_shim_buf_ring_advance(struct io_uring_buf_ring *br, int count);
 
 int uring_shim_buf_ring_mask(uint32_t ring_entries);
