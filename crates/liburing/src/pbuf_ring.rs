@@ -28,7 +28,6 @@ struct DepletedRecv {
     fd: RawFd,
     flags: i32,
     op_id: OpId,
-    returned_at_depletion: u64,
     deferred: bool,
 }
 
@@ -37,8 +36,7 @@ struct DepletedRecvs {
     rearming: Cell<bool>,
     returned: Cell<u64>,
     credits: Cell<u64>,
-    query_allowed: Cell<bool>,
-    kernel_credits: Cell<bool>,
+    started: Cell<bool>,
 }
 
 struct RearmGuard<'a>(&'a Cell<bool>);
@@ -56,8 +54,7 @@ impl DepletedRecvs {
             rearming: Cell::new(false),
             returned: Cell::new(0),
             credits: Cell::new(0),
-            query_allowed: Cell::new(true),
-            kernel_credits: Cell::new(false),
+            started: Cell::new(false),
         }
     }
 
@@ -83,11 +80,9 @@ impl DepletedRecvs {
                 _ => {}
             }
         }
-        if !self.records.iter().any(|record| record.get().is_some()) {
+        if !self.started.get() && !self.records.iter().any(|record| record.get().is_some()) {
             self.returned.set(returned);
             self.credits.set(0);
-            self.query_allowed.set(true);
-            self.kernel_credits.set(false);
         }
         let record = vacant.ok_or(UringError::Syscall {
             op: "mark_depleted_recv",
@@ -97,7 +92,6 @@ impl DepletedRecvs {
             fd,
             flags,
             op_id,
-            returned_at_depletion: returned,
             deferred: self.rearming.get(),
         }));
         Ok(())
@@ -136,51 +130,35 @@ impl DepletedRecvs {
         let replenished = returned.wrapping_sub(self.returned.replace(returned));
         self.credits
             .set(self.credits.get().saturating_add(replenished));
+        if self.records.iter().any(|record| record.get().is_some()) {
+            let count = available()?;
+            // Inventory can include earlier staged reservations. After the first
+            // callback succeeds, queries may only reduce the remaining quota.
+            self.credits.set(if self.started.get() {
+                self.credits.get().min(count)
+            } else {
+                count
+            });
+        }
         let mut staged = 0;
-        let mut query_error = None;
-        let mut query_attempted = false;
         for record in &self.records {
             if let Some(pending) = record.get() {
-                if pending.deferred {
-                    continue;
-                }
-                let returned_after_depletion = pending.returned_at_depletion != returned;
-                if (!returned_after_depletion || self.credits.get() == 0)
-                    && self.query_allowed.get()
-                    && !query_attempted
-                {
-                    query_attempted = true;
-                    match available() {
-                        Ok(count) => {
-                            self.credits.set(count);
-                            self.kernel_credits.set(count > 0);
-                            self.query_allowed.set(count == 0);
-                        }
-                        Err(error) => query_error = Some(error),
-                    }
-                }
-                if self.credits.get() == 0
-                    || (!returned_after_depletion && !self.kernel_credits.get())
-                {
+                if pending.deferred || self.credits.get() == 0 {
                     continue;
                 }
                 submitter(pending.fd, pending.flags, pending.op_id, group)?;
                 record.set(None);
                 self.credits.set(self.credits.get() - 1);
-                self.kernel_credits
-                    .set(self.kernel_credits.get() && self.credits.get() > 0);
-                self.query_allowed.set(false);
+                self.started.set(true);
                 staged += 1;
             }
         }
-        query_error.map_or(Ok(staged), Err)
+        Ok(staged)
     }
 }
 
-/// A registered buffer group whose storage remains stable until unregistration.
-///
-/// Construction allocates storage; receiving and returning leases do not allocate.
-/// The ring and its leases are confined to their creating thread.
+/// A thread-confined buffer group with stable storage until unregistration.
+/// Receiving and returning leases do not allocate.
 pub struct ProvidedBufRing {
     ring: NonNull<liburing_sys::io_uring>,
     buffer_ring: NonNull<liburing_sys::io_uring_buf_ring>,
@@ -197,10 +175,8 @@ pub struct ProvidedBufRing {
 impl ProvidedBufRing {
     /// Registers and initially publishes `entries` buffers of `buffer_len` bytes.
     ///
-    /// `entries` must be a power of two in `1..=32768`. Buffer lengths must fit
-    /// both a CQE's signed result and the kernel's descriptor length. The owner
-    /// preallocates `entries` records for terminally depleted receives; recovery
-    /// never allocates and rejects additional records until capacity is freed.
+    /// `entries` must be a power of two in `1..=32768`; lengths fit a signed CQE.
+    /// Recovery preallocates `entries` records and rejects overflow without allocating.
     ///
     /// # Errors
     /// Returns an error for invalid arguments or failed kernel registration.
@@ -292,8 +268,7 @@ impl ProvidedBufRing {
 
     /// Returns the wrapping count of consumed buffers returned by leases.
     ///
-    /// A receive owner can compare this value after `-ENOBUFS` to determine
-    /// whether replenishment has occurred before staging its next receive.
+    /// After `-ENOBUFS`, a changed value indicates replenishment.
     ///
     /// # Panics
     /// Does not panic.
@@ -304,12 +279,10 @@ impl ProvidedBufRing {
 
     /// Parks a receive after its target's terminal `-ENOBUFS` completion.
     ///
-    /// The caller must establish that the receive ended, rather than relying on
-    /// a cancellation control completion. `fd`, socket message `flags`, and
-    /// `op_id` are retained unchanged for the next buffer-select multishot receive.
-    /// Repeating the same operation ID and parameters is idempotent and preserves
-    /// the original replenishment boundary. The descriptor must remain open until
-    /// the receive is rearmed or removed with [`Self::forget_depleted_recv`].
+    /// The caller must establish termination, not just cancellation acknowledgment.
+    /// `fd`, socket message `flags`, and `op_id` are retained for rearming. Identical
+    /// duplicate records are idempotent. Keep the descriptor
+    /// open until rearmed or removed with [`Self::forget_depleted_recv`].
     ///
     /// # Errors
     /// Returns an error for an inactive group, negative descriptor, conflicting
@@ -326,23 +299,20 @@ impl ProvidedBufRing {
 
     /// Stages depleted receives when buffers have been replenished.
     ///
-    /// Each callback receives the original descriptor, message flags, operation
-    /// ID, and this buffer group. It must stage exactly one multishot receive on
-    /// `Ok(())`, and stage nothing on `Err` or panic. Successful records are
-    /// removed; a failing record and all unprocessed records remain pending.
-    /// The return value is the number staged during this bounded scan. A callback
-    /// may return other leases or park other receives; newly returned buffers are
-    /// considered on the next call. Return credits are reserved once per staged
-    /// receive across calls. Before any receive is staged, a kernel availability
-    /// query can detect buffers returned before depletion was dispatched. A failed
-    /// query does not prevent other records from using known return credits.
-    /// No allocations occur in the recovery layer.
+    /// The callback receives the original descriptor, message flags, operation ID,
+    /// and group. It must stage one multishot receive on `Ok(())`, nothing on error
+    /// or panic. Successful records are removed; remaining records survive failure.
+    /// Returns the number staged in this bounded, allocation-free scan. Callbacks
+    /// may return leases or park receives, considered on the next call. Credits
+    /// are reserved once per staged receive across calls. Each scan verifies its
+    /// quota against current kernel inventory before staging any receive. Query
+    /// failure stages nothing; retries cannot recount staged reservations.
     ///
     /// # Errors
     /// Returns an error for an inactive group, recursive recovery, failed kernel
     /// buffer-status query, or callback failure. Earlier successful callbacks
-    /// remain staged when a later one fails. An unchanged-epoch retry requires
-    /// kernel support for querying the provided-buffer ring head.
+    /// remain staged when a later one fails. Recovery requires kernel support
+    /// for querying provided-buffer status.
     ///
     /// # Panics
     /// Propagates callback panics, retaining its pending record and resetting the
@@ -469,8 +439,7 @@ impl ProvidedBufRing {
 
     /// Unregisters the group and releases its kernel ring mapping.
     ///
-    /// The owner retains its buffer storage until drop, and cannot accept new
-    /// leases after a successful call. Failed unregistration leaves it active.
+    /// Storage survives until drop; success prevents new leases, failure leaves it active.
     ///
     /// # Errors
     /// Returns the kernel's error if the group cannot be unregistered.
@@ -550,8 +519,7 @@ impl Drop for ProvidedBufRing {
 
 /// An exclusive receive payload view that returns its buffer on drop.
 ///
-/// Borrowing the owner keeps its registration and storage alive. Dropping a
-/// lease, including during unwinding, republishes the entire buffer capacity.
+/// Keeps its owner alive and republishes full capacity, including during unwinding.
 pub struct PbufLease<'a> {
     owner: &'a ProvidedBufRing,
     id: BufferId,
@@ -629,11 +597,12 @@ mod unit {
         error::UringError,
         id::{BufGroupId, OpId},
     };
-
     fn unavailable() -> crate::error::Result<u64> {
         Ok(0)
     }
-
+    fn reject(_: i32, _: i32, _: OpId, _: BufGroupId) -> crate::error::Result<()> {
+        panic!("no receive may be staged");
+    }
     #[test]
     fn scenario_buffers_returned_before_depletion_and_query_failure() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(2);
@@ -643,54 +612,83 @@ mod unit {
         pending.mark(11, 0, OpId::from_raw(4), 4)?;
         let status_failure = UringError::syscalls("buf_ring_head", libc::EIO);
         assert_eq!(
-            pending.rearm(
-                4,
-                group,
-                || Err(status_failure),
-                |_, _, _, _| panic!("status failed")
-            ),
+            pending.rearm(4, group, || Err(status_failure), reject),
             Err(status_failure)
         );
-        assert_eq!(
-            pending.rearm(4, group, unavailable, |_, _, _, _| panic!("empty")),
-            Ok(0)
-        );
-        assert_eq!(
-            pending.rearm(
-                4,
-                group,
-                || Ok(1),
-                |fd, _, op, _| {
-                    assert_eq!((fd, op), (10, id));
-                    Ok(())
-                }
-            ),
-            Ok(1)
-        );
-        assert_eq!(
-            pending.rearm(4, group, || Ok(1), |_, _, _, _| panic!("reserved")),
-            Ok(0)
-        );
-        let pending = DepletedRecvs::new(2);
-        pending.mark(10, 0, id, 0)?;
-        pending.mark(11, 0, OpId::from_raw(4), 0)?;
-        assert!(pending.forget(id)?);
-        pending.mark(10, 0, id, 1)?;
-        let mut calls = 0;
-        let result = pending.rearm(
-            1,
-            group,
-            || Err(status_failure),
-            |_, _, _, _| {
-                calls += 1;
-                Ok(())
-            },
-        );
-        assert_eq!(result, Err(status_failure));
-        assert_eq!(calls, 1);
+        assert_eq!(pending.rearm(4, group, unavailable, reject), Ok(0));
+        let stage = |fd, _, op, _| {
+            assert_eq!((fd, op), (10, id));
+            Ok(())
+        };
+        assert_eq!(pending.rearm(4, group, || Ok(1), stage), Ok(1));
+        assert_eq!(pending.rearm(4, group, || Ok(1), reject), Ok(0));
         Ok(())
     }
-
+    #[test]
+    fn scenario_mixed_epoch_query_retry_reserves_once() -> crate::error::Result<()> {
+        for (reverse, inventory) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+            let pending = DepletedRecvs::new(2);
+            let (first, second, group) = (OpId(1), OpId(2), BufGroupId(3));
+            if reverse {
+                pending.mark(11, 0, second, 1)?;
+            }
+            pending.mark(10, 0, first, 1)?;
+            if reverse {
+                assert!(pending.forget(second)?);
+            }
+            pending.mark(11, 0, second, 2)?;
+            let error = invalid("inventory query failed");
+            assert_eq!(pending.rearm(2, group, || Err(error), reject), Err(error));
+            assert_eq!(pending.credits.get(), 1);
+            let mut seen = Vec::new();
+            let submit = |_, _, op, _| {
+                if seen.len() == 1 {
+                    return Err(error);
+                }
+                seen.push(op);
+                Ok(())
+            };
+            let result = pending.rearm(2, group, || Ok(inventory), submit);
+            assert_eq!(result, if inventory == 1 { Ok(1) } else { Err(error) });
+            assert_eq!(pending.credits.get(), inventory - 1);
+            let epoch = if inventory == 1 { 3 } else { 2 };
+            let submit = |_, _, op, _| {
+                seen.push(op);
+                Ok(())
+            };
+            assert_eq!(pending.rearm(epoch, group, || Ok(1), submit), Ok(1));
+            assert_eq!(
+                seen,
+                if reverse {
+                    [second, first]
+                } else {
+                    [first, second]
+                }
+            );
+            pending.mark(12, 0, OpId(4), epoch)?;
+            assert_eq!(pending.rearm(epoch, group, || Ok(2), reject), Ok(0));
+        }
+        Ok(())
+    }
+    #[test]
+    fn scenario_multishot_consumption_invalidates_leftover_credit() -> crate::error::Result<()> {
+        let pending = DepletedRecvs::new(2);
+        let (id, group) = (OpId(1), BufGroupId(3));
+        pending.mark(10, 0, id, 0)?;
+        assert_eq!(
+            pending.rearm(0, group, || Ok(2), |_, _, _, _| Ok(())),
+            Ok(1)
+        );
+        assert_eq!(pending.credits.get(), 1);
+        pending.mark(10, 0, id, 0)?;
+        assert_eq!(pending.rearm(0, group, unavailable, reject), Ok(0));
+        assert_eq!(pending.credits.get(), 0);
+        assert_eq!(
+            pending.rearm(2, group, || Ok(2), |_, _, _, _| Ok(())),
+            Ok(1)
+        );
+        Ok(())
+    }
     #[test]
     fn lifecycle_scenario_depleted_receive_retry() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(1);
@@ -700,37 +698,24 @@ mod unit {
         pending.mark(12, 3, op_id, 11)?;
         assert!(pending.mark(13, 3, op_id, 10).is_err());
         assert!(pending.mark(13, 0, OpId::from_raw(8), 10).is_err());
-        assert_eq!(
-            pending.rearm(10, group, unavailable, |_, _, _, _| panic!(
-                "no returned buffer"
-            )),
-            Ok(0)
-        );
+        assert_eq!(pending.rearm(10, group, unavailable, reject), Ok(0));
         assert!(
             pending
-                .rearm(11, group, unavailable, |_, _, _, _| Err(invalid("SQ full")))
+                .rearm(11, group, || Ok(1), |_, _, _, _| Err(invalid("SQ full")))
                 .is_err()
         );
         let mut calls = 0;
-        assert_eq!(
-            pending.rearm(11, group, unavailable, |fd, flags, id, actual_group| {
-                calls += 1;
-                assert_eq!((fd, flags, id, actual_group), (12, 3, op_id, group));
-                Ok(())
-            }),
-            Ok(1)
-        );
+        let submit = |fd, flags, id, actual_group| {
+            calls += 1;
+            assert_eq!((fd, flags, id, actual_group), (12, 3, op_id, group));
+            Ok(())
+        };
+        assert_eq!(pending.rearm(11, group, || Ok(1), submit), Ok(1));
         assert_eq!(calls, 1);
-        assert_eq!(
-            pending.rearm(12, group, unavailable, |_, _, _, _| panic!(
-                "already rearmed"
-            )),
-            Ok(0)
-        );
+        assert_eq!(pending.rearm(12, group, unavailable, reject), Ok(0));
         assert_eq!(pending.forget(op_id), Ok(false));
         Ok(())
     }
-
     #[test]
     fn scenario_callback_depletion_waits_for_new_return() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(2);
@@ -739,29 +724,33 @@ mod unit {
         let group = BufGroupId(3);
         pending.mark(10, 0, first, 0)?;
         assert_eq!(
-            pending.rearm(1, group, unavailable, |_, _, id, _| {
-                assert_eq!(id, first);
-                pending.mark(11, 0, second, 2)?;
-                Ok(())
-            }),
+            pending.rearm(
+                1,
+                group,
+                || Ok(1),
+                |_, _, id, _| {
+                    assert_eq!(id, first);
+                    pending.mark(11, 0, second, 2)?;
+                    Ok(())
+                }
+            ),
             Ok(1)
         );
+        assert_eq!(pending.rearm(2, group, unavailable, reject), Ok(0));
         assert_eq!(
-            pending.rearm(2, group, unavailable, |_, _, _, _| panic!(
-                "new receive is depleted"
-            )),
-            Ok(0)
-        );
-        assert_eq!(
-            pending.rearm(3, group, unavailable, |fd, _, id, _| {
-                assert_eq!((fd, id), (11, second));
-                Ok(())
-            }),
+            pending.rearm(
+                3,
+                group,
+                || Ok(1),
+                |fd, _, id, _| {
+                    assert_eq!((fd, id), (11, second));
+                    Ok(())
+                }
+            ),
             Ok(1)
         );
         Ok(())
     }
-
     #[test]
     fn lifecycle_scenario_reentrant_and_panicking_recovery() -> crate::error::Result<()> {
         let pending = DepletedRecvs::new(2);
@@ -771,24 +760,34 @@ mod unit {
         pending.mark(10, 0, first, 0)?;
         pending.mark(11, 0, second, 0)?;
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pending.rearm(1, group, unavailable, |_, _, id, _| {
-                assert_eq!(
-                    pending.rearm(1, group, unavailable, |_, _, _, _| Ok(())),
-                    Err(UringError::ReentrantDispatch)
-                );
-                assert_eq!(pending.forget(id), Err(UringError::ReentrantDispatch));
-                pending.mark(10, 0, id, 1)?;
-                panic!("callback failed before staging");
-            })
+            pending.rearm(
+                1,
+                group,
+                || Ok(1),
+                |_, _, id, _| {
+                    assert_eq!(
+                        pending.rearm(1, group, unavailable, |_, _, _, _| Ok(())),
+                        Err(UringError::ReentrantDispatch)
+                    );
+                    assert_eq!(pending.forget(id), Err(UringError::ReentrantDispatch));
+                    pending.mark(10, 0, id, 1)?;
+                    panic!("callback failed before staging");
+                },
+            )
         }));
         assert!(panic.is_err());
         assert_eq!(pending.forget(second), Ok(true));
         assert_eq!(pending.forget(second), Ok(false));
         assert_eq!(
-            pending.rearm(1, group, unavailable, |fd, _, id, _| {
-                assert_eq!((fd, id), (10, first));
-                Ok(())
-            }),
+            pending.rearm(
+                1,
+                group,
+                || Ok(1),
+                |fd, _, id, _| {
+                    assert_eq!((fd, id), (10, first));
+                    Ok(())
+                }
+            ),
             Ok(1)
         );
         Ok(())
