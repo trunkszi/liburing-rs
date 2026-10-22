@@ -68,6 +68,18 @@ operation with `OpId::pack` and recover its parts with `unpack`. Payload fields,
 including operation kind, socket generation, and sequence number, belong to the
 subsystem's codec. The bridge uses this space to reject stale poll completions.
 
+The `OpPayloadCodec` derive accepts `u8`, `u16`, and `u32` fields, including
+their `core::primitive::` and `std::primitive::` paths. Each accepted field must
+resolve to the corresponding primitive type; an alias with a different width
+or signedness is rejected. Fields and enum tags together must fit within 56 bits.
+Named fields, including `raw`, `body`, and `tag`, keep their values through
+encoding and decoding.
+
+`define_subsystems!` declares fieldless subsystem variants with explicit, unique
+IDs in `1..=255`. Its enum and variants reject `cfg` and `cfg_attr` attributes.
+Place a conditional attribute on the macro invocation or its containing module
+to enable or disable the complete declaration and all generated helpers together.
+
 Register a `SubsystemHandler` before submitting its operations. Completion
 dispatch calls its `on_completion` on the owner thread, followed by the optional
 observer passed to `poll_completions` or `wait_completions`. Internal wake CQEs are

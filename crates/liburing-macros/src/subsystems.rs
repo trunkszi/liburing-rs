@@ -30,6 +30,7 @@ struct DeclaredVariant {
 /// - the enum is generic or has a where clause;
 /// - the enum has no variants;
 /// - the enum or a variant already has a `derive` or `repr` attribute;
+/// - the enum or a variant has a `cfg` or `cfg_attr` attribute;
 /// - a variant has fields;
 /// - a variant has no discriminant, or the discriminant is not an integer literal (parentheses and
 ///   invisible groups around a single literal are accepted; arithmetic is not);
@@ -57,7 +58,7 @@ pub fn expand(input: proc_macro2::TokenStream) -> syn::Result<proc_macro2::Token
 /// This function does not panic.
 fn expand_enum(item: &ItemEnum) -> syn::Result<TokenStream> {
     reject_generics(item)?;
-    reject_supplied_attributes(&item.attrs)?;
+    reject_input_attributes(&item.attrs)?;
     let declared = collect_variants(item)?;
     Ok(render(item, &declared))
 }
@@ -84,26 +85,35 @@ fn reject_generics(item: &ItemEnum) -> syn::Result<()> {
     ))
 }
 
-/// Reject `derive` and `repr` because the macro emits both itself.
+/// Reject macro-supplied and conditional attributes.
+///
+/// Conditional attributes cannot be retained on the enum alone: routing
+/// helpers must reference exactly the variants present in the enum. Callers
+/// can conditionally declare the entire macro invocation instead.
 ///
 /// # Errors
 ///
-/// Returns one error per supplied `derive` or `repr` attribute. The errors
-/// are combined so every offending attribute is reported together.
+/// Returns one error per `derive`, `repr`, `cfg`, or `cfg_attr` attribute.
+/// The errors are combined so every offending attribute is reported together.
 ///
 /// # Panics
 ///
 /// This function does not panic.
-fn reject_supplied_attributes(attrs: &[Attribute]) -> syn::Result<()> {
+fn reject_input_attributes(attrs: &[Attribute]) -> syn::Result<()> {
     let mut found: Option<syn::Error> = None;
     for attr in attrs {
-        let Some(name) = supplied_attribute_name(attr) else {
+        let Some(name) = forbidden_attribute_name(attr) else {
             continue;
         };
-        let err = syn::Error::new_spanned(
-            attr,
-            format!("`#[{name}]` is supplied by the macro and must not be written in the input"),
-        );
+        let message = if matches!(name, "cfg" | "cfg_attr") {
+            format!(
+                "`#[{name}]` is not supported by define_subsystems!; conditionally declare the \
+                 entire macro invocation instead"
+            )
+        } else {
+            format!("`#[{name}]` is supplied by the macro and must not be written in the input")
+        };
+        let err = syn::Error::new_spanned(attr, message);
         found = Some(fold_error(found, err));
     }
     match found {
@@ -127,16 +137,20 @@ fn fold_error(found: Option<syn::Error>, err: syn::Error) -> syn::Error {
     }
 }
 
-/// Return `derive` or `repr` when `attr` is one the macro supplies.
+/// Return the name of an attribute unsupported in the macro input.
 ///
 /// # Panics
 ///
 /// This function does not panic.
-fn supplied_attribute_name(attr: &Attribute) -> Option<&'static str> {
+fn forbidden_attribute_name(attr: &Attribute) -> Option<&'static str> {
     if attr.path().is_ident("derive") {
         Some("derive")
     } else if attr.path().is_ident("repr") {
         Some("repr")
+    } else if attr.path().is_ident("cfg") {
+        Some("cfg")
+    } else if attr.path().is_ident("cfg_attr") {
+        Some("cfg_attr")
     } else {
         None
     }
@@ -194,7 +208,7 @@ fn collect_variants(item: &ItemEnum) -> syn::Result<Vec<DeclaredVariant>> {
 ///
 /// # Errors
 ///
-/// Returns a spanned error for fields, a macro-supplied attribute, a missing
+/// Returns a spanned error for fields, an unsupported attribute, a missing
 /// or non-literal discriminant, id `0`, an id outside `1..=255`, or a
 /// duplicate id. Duplicate errors span this later variant.
 ///
@@ -205,7 +219,7 @@ fn declare_variant(
     variant: &Variant,
     declared: &[DeclaredVariant],
 ) -> syn::Result<DeclaredVariant> {
-    reject_supplied_attributes(&variant.attrs)?;
+    reject_input_attributes(&variant.attrs)?;
     if !matches!(variant.fields, Fields::Unit) {
         return Err(syn::Error::new_spanned(
             variant,
@@ -442,5 +456,65 @@ fn render(item: &ItemEnum, declared: &[DeclaredVariant]) -> TokenStream {
             }
             #(#assert_ids)*
         };
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use quote::quote;
+
+    #[test]
+    fn conditional_attributes_are_rejected_on_enums_and_variants() {
+        let cases = [
+            (
+                quote!(
+                    #[cfg(any())]
+                    enum Subsystems {
+                        Network = 1,
+                    }
+                ),
+                "cfg",
+            ),
+            (
+                quote!(
+                    enum Subsystems {
+                        #[cfg(any())]
+                        Network = 1,
+                    }
+                ),
+                "cfg",
+            ),
+            (
+                quote!(
+                    #[cfg_attr(any(), repr(u16))]
+                    enum Subsystems {
+                        Network = 1,
+                    }
+                ),
+                "cfg_attr",
+            ),
+            (
+                quote!(
+                    enum Subsystems {
+                        #[cfg_attr(any(), doc = "network")]
+                        Network = 1,
+                    }
+                ),
+                "cfg_attr",
+            ),
+        ];
+        for (input, attribute) in cases {
+            let error = match super::expand(input) {
+                Ok(_) => panic!("conditional attribute was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "`#[{attribute}]` is not supported by define_subsystems!; conditionally \
+                     declare the entire macro invocation instead"
+                )
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Expansion of [`OpPayloadCodec`](crate::derive_op_payload_codec).
 
-use proc_macro2::{Literal, TokenStream};
+use proc_macro2::{Literal, Span, TokenStream};
 use quote::quote;
 use syn::{
     Data, DataEnum, DataStruct, DeriveInput, Error, Expr, Fields, Ident, Index, Result, Type,
@@ -27,11 +27,12 @@ struct PackedField {
     offset: u32,
     ty: Type,
     kind: FieldKind,
+    binding: Ident,
 }
 
 enum FieldKind {
     Named(Ident),
-    Unnamed(Ident, Index),
+    Unnamed(Index),
 }
 
 struct Arm {
@@ -219,17 +220,18 @@ fn pack_fields(fields: &Fields) -> Result<Vec<PackedField>> {
     let mut offset = 0u32;
     for (index, field) in fields.iter().enumerate() {
         let bits = integer_bits(&field.ty)?;
+        let binding = internal(&format!("field_{index}"));
         let kind = if let Some(name) = &field.ident {
             FieldKind::Named(name.clone())
         } else {
-            let binding = Ident::new(&format!("field_{index}"), field.span());
-            FieldKind::Unnamed(binding, Index::from(index))
+            FieldKind::Unnamed(Index::from(index))
         };
         packed.push(PackedField {
             bits,
             offset,
             ty: field.ty.clone(),
             kind,
+            binding,
         });
         offset = offset
             .checked_add(bits)
@@ -251,12 +253,19 @@ fn integer_bits(ty: &Type) -> Result<u32> {
     if path.qself.is_some() {
         return Err(bad_field(ty));
     }
-    let Some(segment) = path.path.segments.last() else {
-        return Err(bad_field(ty));
-    };
-    if !segment.arguments.is_empty() {
+    let segments: Vec<_> = path.path.segments.iter().collect();
+    if segments.iter().any(|segment| !segment.arguments.is_empty()) {
         return Err(bad_field(ty));
     }
+    let segment = match segments.as_slice() {
+        [primitive] if path.path.leading_colon.is_none() => *primitive,
+        [root, module, primitive]
+            if (root.ident == "core" || root.ident == "std") && module.ident == "primitive" =>
+        {
+            *primitive
+        }
+        _ => return Err(bad_field(ty)),
+    };
     match segment.ident.to_string().as_str() {
         "u8" => Ok(8),
         "u16" => Ok(16),
@@ -266,7 +275,11 @@ fn integer_bits(ty: &Type) -> Result<u32> {
 }
 
 fn bad_field(ty: &Type) -> Error {
-    Error::new_spanned(ty, "OpPayloadCodec fields must be u8, u16, or u32")
+    Error::new_spanned(
+        ty,
+        "OpPayloadCodec fields must be primitive u8, u16, or u32, optionally qualified by \
+         core::primitive or std::primitive",
+    )
 }
 
 fn literal_u64(expr: &Expr) -> Result<u64> {
@@ -319,6 +332,14 @@ fn sum_bits(fields: &[PackedField]) -> core::result::Result<u32, &'static str> {
 fn render(name: &Ident, bits: u32, layout: &Layout) -> TokenStream {
     let encode = encode_body(layout);
     let decode = decode_body(bits, layout);
+    let raw = internal("raw");
+    let type_checks = layout_fields(layout).into_iter().map(|field| {
+        let ty = &field.ty;
+        let primitive = Ident::new(&format!("u{}", field.bits), Span::mixed_site());
+        quote! {
+            let _: fn(#ty) -> ::core::primitive::#primitive = ::core::convert::identity::<#ty>;
+        }
+    });
     quote! {
         impl #name {
             /// Number of low bits occupied by a packed payload.
@@ -329,7 +350,7 @@ fn render(name: &Ident, bits: u32, layout: &Layout) -> TokenStream {
             /// # Panics
             ///
             /// This constant cannot panic.
-            pub const PAYLOAD_BITS: u32 = #bits;
+            pub const PAYLOAD_BITS: ::core::primitive::u32 = #bits;
 
             /// Pack `self` into the low [`Self::PAYLOAD_BITS`] bits of a `u64`.
             ///
@@ -340,7 +361,7 @@ fn render(name: &Ident, bits: u32, layout: &Layout) -> TokenStream {
             /// This function does not panic.
             #[inline]
             #[must_use]
-            pub const fn encode_payload(&self) -> u64 {
+            pub const fn encode_payload(&self) -> ::core::primitive::u64 {
                 #encode
             }
 
@@ -357,18 +378,37 @@ fn render(name: &Ident, bits: u32, layout: &Layout) -> TokenStream {
             /// This function does not panic.
             #[inline]
             #[must_use]
-            pub const fn decode_payload(raw: u64) -> core::result::Result<Self, u64> {
+            pub const fn decode_payload(#raw: ::core::primitive::u64)
+                -> ::core::result::Result<Self, ::core::primitive::u64>
+            {
                 #decode
             }
         }
 
         const _: () = {
             assert!(#name::PAYLOAD_BITS <= 56);
+            #(#type_checks)*
         };
     }
 }
 
+fn layout_fields(layout: &Layout) -> Vec<&PackedField> {
+    match layout {
+        Layout::Fields { fields, .. } => fields.iter().collect(),
+        Layout::Fieldless(_) => Vec::new(),
+        Layout::Tagged { variants, .. } => variants
+            .iter()
+            .flat_map(|variant| variant.fields.iter())
+            .collect(),
+    }
+}
+
+fn internal(name: &str) -> Ident {
+    Ident::new(&format!("__uring_payload_{name}"), Span::mixed_site())
+}
+
 fn encode_body(layout: &Layout) -> TokenStream {
+    let raw = internal("raw");
     match layout {
         Layout::Fields { fields, .. } => {
             if fields.is_empty() {
@@ -379,13 +419,13 @@ fn encode_body(layout: &Layout) -> TokenStream {
             }
             let stores = fields.iter().map(|field| {
                 let read = field_read(field);
-                let shifted = shift_left(quote!((#read as u64)), field.offset);
-                quote! { raw |= #shifted; }
+                let shifted = shift_left(quote!((#read as ::core::primitive::u64)), field.offset);
+                quote! { #raw |= #shifted; }
             });
             quote! {
-                let mut raw = 0u64;
+                let mut #raw = 0u64;
                 #(#stores)*
-                raw
+                #raw
             }
         }
         Layout::Fieldless(arms) => {
@@ -414,55 +454,52 @@ fn encode_body(layout: &Layout) -> TokenStream {
 }
 
 fn tagged_encode_arm(tag_bits: u32, variant: &TaggedArm) -> TokenStream {
-    let pattern = variant_pattern(variant);
+    let pattern = construct_variant(variant);
     let tag = Literal::u64_unsuffixed(variant.tag);
+    let raw = internal("raw");
     if variant.fields.is_empty() {
         return quote! { #pattern => #tag };
     }
-    let copies = variant.fields.iter().map(|field| {
-        let binding = field_binding(field);
-        quote! { let #binding = *#binding as u64; }
-    });
     let placed = variant.fields.iter().map(|field| {
         let binding = field_binding(field);
         let offset = tag_bits.saturating_add(field.offset);
-        shift_left(quote!(#binding), offset)
+        shift_left(quote!((*#binding as ::core::primitive::u64)), offset)
     });
     quote! {
         #pattern => {
-            #(#copies)*
-            let mut raw = #tag;
-            #(raw |= #placed;)*
-            raw
+            let mut #raw = #tag;
+            #(#raw |= #placed;)*
+            #raw
         }
     }
 }
 
 fn decode_body(bits: u32, layout: &Layout) -> TokenStream {
+    let raw = internal("raw");
     match layout {
         Layout::Fields { style, fields } => {
-            let guard = high_guard(quote!(raw), bits);
-            let locals = fields.iter().map(field_decode);
+            let guard = high_guard(quote!(#raw), bits);
+            let locals = fields.iter().map(|field| field_decode(field, quote!(#raw)));
             let constructed = construct_struct(style, fields);
             quote! {
                 #guard
                 #(#locals)*
-                core::result::Result::Ok(#constructed)
+                ::core::result::Result::Ok(#constructed)
             }
         }
         Layout::Fieldless(arms) => {
             let arms = arms.iter().map(|arm| {
                 let name = &arm.name;
                 let value = Literal::u64_unsuffixed(arm.discriminant);
-                quote! { #value => core::result::Result::Ok(Self::#name) }
+                quote! { #value => ::core::result::Result::Ok(Self::#name) }
             });
             quote! {
-                if raw > 0x00FF_FFFF_FFFF_FFFFu64 {
-                    return core::result::Result::Err(raw);
+                if #raw > 0x00FF_FFFF_FFFF_FFFFu64 {
+                    return ::core::result::Result::Err(#raw);
                 }
-                match raw {
+                match #raw {
                     #(#arms,)*
-                    _ => core::result::Result::Err(raw),
+                    _ => ::core::result::Result::Err(#raw),
                 }
             }
         }
@@ -471,60 +508,67 @@ fn decode_body(bits: u32, layout: &Layout) -> TokenStream {
 }
 
 fn tagged_decode(tag_bits: u32, variants: &[TaggedArm]) -> TokenStream {
+    let raw = internal("raw");
+    let body = internal("body");
+    let tag = internal("tag");
     let arms = variants.iter().map(|variant| {
         let tag = Literal::u64_unsuffixed(variant.tag);
-        let guard = high_guard(quote!(body), variant.field_bits);
-        let locals = variant.fields.iter().map(|field| {
-            let binding = field_binding(field);
-            let ty = &field.ty;
-            let masked = mask_shift(quote!(body), field.offset, field.bits);
-            quote! { let #binding = (#masked) as #ty; }
-        });
+        let guard = high_guard(quote!(#body), variant.field_bits);
+        let locals = variant
+            .fields
+            .iter()
+            .map(|field| field_decode(field, quote!(#body)));
         let constructed = construct_variant(variant);
         quote! {
             #tag => {
                 #guard
                 #(#locals)*
-                core::result::Result::Ok(#constructed)
+                ::core::result::Result::Ok(#constructed)
             }
         }
     });
     let split = if tag_bits == 0 {
         quote! {
-            let tag = 0u64;
-            let body = raw;
+            let #tag = 0u64;
+            let #body = #raw;
         }
     } else {
         let mask = tag_mask(tag_bits);
         quote! {
-            let tag = raw & #mask;
-            let body = raw >> #tag_bits;
+            let #tag = #raw & #mask;
+            let #body = #raw >> #tag_bits;
         }
     };
-    // `tag` is a `u64` even when the only variant forces the value to 0.
-    // Rust does not narrow that binding, so the wildcard stays for exhaustiveness.
-    let wildcard = quote! { _ => core::result::Result::Err(raw), };
+    // The tag remains a u64 even when a sole variant forces its value to zero.
     quote! {
-        if raw > 0x00FF_FFFF_FFFF_FFFFu64 {
-            return core::result::Result::Err(raw);
+        if #raw > 0x00FF_FFFF_FFFF_FFFFu64 {
+            return ::core::result::Result::Err(#raw);
         }
         #split
-        match tag {
+        match #tag {
             #(#arms)*
-            #wildcard
+            _ => ::core::result::Result::Err(#raw),
         }
     }
 }
 
-fn field_decode(field: &PackedField) -> TokenStream {
+fn field_decode(field: &PackedField, source: TokenStream) -> TokenStream {
     let binding = field_binding(field);
     let ty = &field.ty;
-    let masked = mask_shift(quote!(raw), field.offset, field.bits);
+    let masked = mask_shift(source, field.offset, field.bits);
     quote! { let #binding = (#masked) as #ty; }
 }
 
+fn named_field(field: &PackedField) -> TokenStream {
+    let binding = field_binding(field);
+    match &field.kind {
+        FieldKind::Named(name) => quote!(#name: #binding),
+        FieldKind::Unnamed(_) => quote!(#binding),
+    }
+}
+
 fn construct_struct(style: &VariantStyle, fields: &[PackedField]) -> TokenStream {
-    let names = fields.iter().map(field_binding);
+    let names = fields.iter().map(named_field);
     match style {
         VariantStyle::Unit => quote!(Self),
         VariantStyle::Named => quote!(Self { #(#names),* }),
@@ -534,44 +578,22 @@ fn construct_struct(style: &VariantStyle, fields: &[PackedField]) -> TokenStream
 
 fn construct_variant(variant: &TaggedArm) -> TokenStream {
     let name = &variant.name;
+    let names = variant.fields.iter().map(named_field);
     match variant.style {
         VariantStyle::Unit => quote!(Self::#name),
-        VariantStyle::Named => {
-            let names = variant.fields.iter().map(field_binding);
-            quote!(Self::#name { #(#names),* })
-        }
-        VariantStyle::Unnamed => {
-            let names = variant.fields.iter().map(field_binding);
-            quote!(Self::#name(#(#names),*))
-        }
-    }
-}
-
-fn variant_pattern(variant: &TaggedArm) -> TokenStream {
-    let name = &variant.name;
-    match variant.style {
-        VariantStyle::Unit => quote!(Self::#name),
-        VariantStyle::Named => {
-            let names = variant.fields.iter().map(field_binding);
-            quote!(Self::#name { #(#names),* })
-        }
-        VariantStyle::Unnamed => {
-            let names = variant.fields.iter().map(field_binding);
-            quote!(Self::#name(#(#names),*))
-        }
+        VariantStyle::Named => quote!(Self::#name { #(#names),* }),
+        VariantStyle::Unnamed => quote!(Self::#name(#(#names),*)),
     }
 }
 
 fn field_binding(field: &PackedField) -> Ident {
-    match &field.kind {
-        FieldKind::Named(name) | FieldKind::Unnamed(name, _) => name.clone(),
-    }
+    field.binding.clone()
 }
 
 fn field_read(field: &PackedField) -> TokenStream {
     match &field.kind {
         FieldKind::Named(name) => quote!(self.#name),
-        FieldKind::Unnamed(_, index) => quote!(self.#index),
+        FieldKind::Unnamed(index) => quote!(self.#index),
     }
 }
 
@@ -593,16 +615,17 @@ fn mask_shift(source: TokenStream, offset: u32, bits: u32) -> TokenStream {
 }
 
 fn high_guard(source: TokenStream, bits: u32) -> TokenStream {
+    let raw = internal("raw");
     if bits == 0 {
         quote! {
             if #source != 0 {
-                return core::result::Result::Err(raw);
+                return ::core::result::Result::Err(#raw);
             }
         }
     } else {
         quote! {
             if (#source >> #bits) != 0 {
-                return core::result::Result::Err(raw);
+                return ::core::result::Result::Err(#raw);
             }
         }
     }
