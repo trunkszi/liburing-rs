@@ -153,7 +153,11 @@ fn send_fixed(
             }
         })?;
         let completion = next(proactor, completions, SEND)?;
-        assert_eq!(completion.flags & sys::IORING_CQE_F_MORE, 0);
+        if completion.flags & sys::IORING_CQE_F_MORE != 0 {
+            return Err(
+                io::Error::other(format!("non-final fixed write CQE: {completion:?}")).into(),
+            );
+        }
         // SAFETY: This exact write's final CQE ends all kernel reads of its
         // registered allocation, including when the write reports an error.
         buffer = unsafe { waiting.complete()? };
@@ -224,18 +228,29 @@ fn main() -> ExampleResult {
     while received.len() < payload.len() {
         let completion = next(&mut proactor, &completions, RECEIVE)?;
         let length = check_result(completion)?;
-        assert!(length > 0, "unexpected TCP EOF");
+        if length == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected TCP EOF").into());
+        }
         // SAFETY: This genuine unconsumed CQE selects an in-bounds buffer from
         // this exact group. The lease exclusively owns its reported payload.
         let lease = unsafe { group.lease_from_cqe(completion.flags, completion.result)? };
         received.extend_from_slice(&lease);
         if received.len() < payload.len() {
-            assert_ne!(completion.flags & sys::IORING_CQE_F_MORE, 0);
+            if completion.flags & sys::IORING_CQE_F_MORE == 0 {
+                return Err(io::Error::other(format!(
+                    "receive ended before payload: {completion:?}"
+                ))
+                .into());
+            }
             // Keep the sole selected buffer leased until the terminal CQE;
             // returning it earlier could conceal the exhaustion being shown.
             let depleted = next(&mut proactor, &completions, RECEIVE)?;
-            assert_eq!(depleted.result, -libc::ENOBUFS);
-            assert_eq!(depleted.flags & sys::IORING_CQE_F_MORE, 0);
+            if depleted.result != -libc::ENOBUFS || depleted.flags & sys::IORING_CQE_F_MORE != 0 {
+                return Err(io::Error::other(format!(
+                    "expected terminal ENOBUFS CQE: {depleted:?}"
+                ))
+                .into());
+            }
             group.mark_depleted_recv(accepted.as_raw_fd(), 0, op(RECEIVE))?;
             with_group_recovery(&group, lease, &mut proactor, &receiving)?;
             recoveries += 1;
@@ -252,10 +267,18 @@ fn main() -> ExampleResult {
             unsafe { net::prep_cancel(sqe, op(RECEIVE), 0) };
         })?;
         let cancel = next(&mut proactor, &completions, CANCEL)?;
-        assert!([0, -libc::ENOENT, -libc::EALREADY].contains(&cancel.result));
+        if ![0, -libc::ENOENT, -libc::EALREADY].contains(&cancel.result) {
+            return Err(io::Error::other(format!("unexpected cancel CQE: {cancel:?}")).into());
+        }
         let terminal = next(&mut proactor, &completions, RECEIVE)?;
-        assert_eq!(terminal.flags & sys::IORING_CQE_F_MORE, 0);
-        assert!([-libc::ECANCELED, -libc::ENOBUFS].contains(&terminal.result));
+        if terminal.flags & sys::IORING_CQE_F_MORE != 0
+            || ![-libc::ECANCELED, -libc::ENOBUFS].contains(&terminal.result)
+        {
+            return Err(io::Error::other(format!(
+                "unexpected receive retirement CQE: {terminal:?}"
+            ))
+            .into());
+        }
     }
     assert!(!receiving.get());
     group.forget_depleted_recv(op(RECEIVE))?;
@@ -273,7 +296,9 @@ fn main() -> ExampleResult {
         unsafe { net::prep_close_direct(sqe, accepted_slot) };
     })?;
     let closed = next(&mut proactor, &completions, CLOSE)?;
-    assert_eq!((closed.result, closed.flags), (0, 0));
+    if closed.result != 0 || closed.flags != 0 {
+        return Err(io::Error::other(format!("CLOSE_DIRECT failed: {closed:?}")).into());
+    }
     // SAFETY: This exact direct-close target succeeded finally, with no pending
     // I/O or future SQEs referencing the accepted socket's fixed-file slot.
     let reclaimed_fd = unsafe { files.reclaim_direct_close(accepted_slot)? };

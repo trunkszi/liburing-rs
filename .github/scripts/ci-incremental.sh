@@ -138,12 +138,12 @@ for package in "${packages[@]}"; do
     selected+=("$package")
   fi
 done
+cargo fmt --all -- --check
 if [ "${#selected[@]}" -eq 0 ]; then
   echo 'No Cargo packages affected; validating all examples'
   run_examples
   exit 0
 fi
-cargo fmt --all -- --check
 for package in "${selected[@]}"; do
   cargo clippy -p "$package" --all-targets -- -D warnings
   cargo test -p "$package"
