@@ -361,13 +361,22 @@ pub unsafe fn prep_close(sqe: *mut io_uring_sqe, fd: RawFd) {
 /// Preparation reports no errors; the operation result is returned in its CQE.
 ///
 /// # Panics
-/// Does not panic.
+/// Panics if `slot.raw() == u32::MAX`: the direct-close encoding adds one to
+/// the index, which wraps to zero and makes the kernel treat the request as an
+/// ordinary close of descriptor 0 instead of a registered-file close.
 ///
 /// # Safety
 /// `sqe` must point to one initialized, exclusively owned, writable SQE that
 /// has not been published. `slot` must name a live registered file. Retire prior operations before
 /// close executes and recycle the table slot only after successful close CQE.
+/// Do not set `IOSQE_FIXED_FILE` on this SQE: a direct close already targets the
+/// registered file, and the flag makes the request complete with `-EBADF`.
 pub unsafe fn prep_close_direct(sqe: *mut io_uring_sqe, slot: UringFileSlot) {
+    assert_ne!(
+        slot.raw(),
+        u32::MAX,
+        "slot u32::MAX cannot be encoded as a direct close: file_index + 1 wraps to 0"
+    );
     // SAFETY: SQE storage is exclusively writable. The live fixed-file slot is
     // encoded as a direct-close index; reclamation waits for its successful CQE.
     unsafe {
@@ -442,5 +451,35 @@ pub unsafe fn prep_write_fixed(
             offset,
             i32::from(buffer.raw()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::MaybeUninit;
+
+    use super::*;
+
+    #[test]
+    fn close_direct_encodes_slot_zero_as_index_one() {
+        // SAFETY: An all-zero SQE is valid initialized storage; the helper
+        // initializes the fields read below.
+        let mut sqe = unsafe { MaybeUninit::<io_uring_sqe>::zeroed().assume_init() };
+        // SAFETY: Exclusive initialized SQE storage.
+        unsafe { prep_close_direct(&mut sqe, UringFileSlot(0)) };
+        assert_eq!(sqe.fd, 0);
+        // SAFETY: The helper initialized the file_index union field.
+        assert_eq!(unsafe { sqe.__bindgen_anon_5.file_index }, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32::MAX")]
+    fn close_direct_rejects_unrepresentable_slot() {
+        // SAFETY: An all-zero SQE is valid initialized storage; the slot is
+        // rejected before any field is encoded.
+        let mut sqe = unsafe { MaybeUninit::<io_uring_sqe>::zeroed().assume_init() };
+        // SAFETY: Exclusive initialized SQE storage; the input is deliberately
+        // unrepresentable and must panic.
+        unsafe { prep_close_direct(&mut sqe, UringFileSlot(u32::MAX)) };
     }
 }

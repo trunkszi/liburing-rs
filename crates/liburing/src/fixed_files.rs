@@ -316,17 +316,20 @@ impl FixedFileTable {
 
     /// Recycles a slot whose direct-close operation completed successfully.
     ///
-    /// No registration syscall is issued because `CLOSE_DIRECT` already removed
-    /// the kernel reference. The returned value identifies the originally
-    /// registered descriptor; it does not transfer descriptor ownership. It
-    /// remains a valid handle only while the caller keeps that original
-    /// descriptor open. After the caller closes or reuses the number, treat it
-    /// as a bookkeeping identifier only: never close it again and never assume
-    /// it names the slot's current file.
+    /// Clears the kernel slot with a `-1` update before releasing it. The update
+    /// is a no-op when the direct close already emptied the kernel slot; it also
+    /// removes the retained duplicate that [`Self::grow`] may have re-registered
+    /// while the close CQE waited for reclamation. The returned value identifies
+    /// the originally registered descriptor; it does not transfer descriptor
+    /// ownership. It remains a valid handle only while the caller keeps that
+    /// original descriptor open. After the caller closes or reuses the number,
+    /// treat it as a bookkeeping identifier only: never close it again and never
+    /// assume it names the slot's current file.
     ///
     /// # Errors
-    /// Returns an error if the table is unregistered or the slot is invalid or
-    /// already free. An error leaves the free-slot stack unchanged.
+    /// Returns an error if the table is unregistered, the slot is invalid or
+    /// already free, or the kernel slot update fails. An error leaves the
+    /// registration and the free-slot stack unchanged.
     ///
     /// # Panics
     /// Does not panic.
@@ -337,7 +340,16 @@ impl FixedFileTable {
     /// have retired, and the slot must not have been externally repopulated.
     /// A cancellation-control CQE never satisfies this condition.
     pub unsafe fn reclaim_direct_close(&mut self, slot: UringFileSlot) -> Result<RawFd> {
+        self.reclaim_with(slot, |table, index, fd| table.update(index, fd))
+    }
+
+    fn reclaim_with(
+        &mut self,
+        slot: UringFileSlot,
+        update: impl FnOnce(&mut Self, u32, RawFd) -> Result<()>,
+    ) -> Result<RawFd> {
         let fd = self.occupied(slot)?;
+        update(self, slot.0, -1)?;
         self.entries[slot.0 as usize] = None;
         self.retained[slot.0 as usize] = None;
         self.free.push(slot.0);
@@ -602,6 +614,32 @@ mod tests {
         assert_eq!((table.len(), table.available()), (0, 0));
         assert!(table.insert(10).is_err());
         assert!(table.grow(8).is_err());
+    }
+
+    #[test]
+    fn reclaim_updates_kernel_slot_before_releasing() {
+        let mut table = fake_table();
+        assert!(table.grow_with(4, |_| Ok(())).is_ok());
+        let mut observed = None;
+        let result = table.reclaim_with(UringFileSlot(0), |table, index, fd| {
+            observed = Some((index, fd, table.get(UringFileSlot(0))));
+            Ok(())
+        });
+        assert_eq!(result, Ok(10));
+        assert_eq!(observed, Some((0, -1, Some(10))));
+        assert_eq!(table.get(UringFileSlot(0)), None);
+        assert_eq!(table.free.last(), Some(&0));
+        assert!(table.retained[0].is_none());
+    }
+
+    #[test]
+    fn reclaim_update_failure_preserves_slot() {
+        let mut table = fake_table();
+        let result = table.reclaim_with(UringFileSlot(0), |_, _, _| Err(errno(EIO)));
+        assert_eq!(result, Err(errno(EIO)));
+        assert_eq!(table.get(UringFileSlot(0)), Some(10));
+        assert!(table.retained[0].is_some());
+        assert_eq!(table.free, [1]);
     }
 
     #[test]
