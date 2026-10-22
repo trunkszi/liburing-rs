@@ -402,3 +402,126 @@ fn integration_lifecycle_scenario_drop_cancels_pending_handler_owned_pipe_read()
     assert!(started.elapsed() < Duration::from_secs(3));
     Ok(())
 }
+
+#[test]
+fn integration_lifecycle_scenario_failed_shutdown_allows_only_drain_retries() -> TestResult {
+    let mut bounded = config(true);
+    bounded.entries = 64;
+    bounded.cq_entries = Some(128);
+    bounded.max_cqe_batch = 1;
+    let mut proactor = Proactor::new(bounded)?;
+    let counts = Rc::new(RefCell::new([0; 3]));
+    proactor.register_subsystem(
+        SubsystemId(1),
+        CountingHandler {
+            id: SubsystemId(1),
+            counts: Rc::clone(&counts),
+            fanout: 0,
+        },
+    )?;
+    for payload in 0..64 {
+        proactor.alloc_sqe(op(1, payload))?;
+    }
+    proactor.submit()?;
+    // The one-CQE budget leaves completed operations pending after 33 drains.
+    assert!(matches!(
+        proactor.shutdown(),
+        Err(UringError::Wait(libc::EBUSY))
+    ));
+    assert!(proactor.ring_mut().is_null());
+    assert!(proactor.alloc_sqe(op(1, 65)).is_err());
+    assert!(proactor.submit().is_err());
+    assert!(proactor.tick().is_err());
+    assert!(
+        proactor
+            .poll_completions(1, |_, _| panic!("dispatch during shutdown"))
+            .is_err()
+    );
+    assert!(
+        proactor
+            .wait_completions(1, Some(Duration::ZERO), |_, _| {
+                panic!("dispatch during shutdown")
+            })
+            .is_err()
+    );
+    assert!(
+        proactor
+            .register_subsystem(
+                SubsystemId(2),
+                CountingHandler {
+                    id: SubsystemId(2),
+                    counts: Rc::clone(&counts),
+                    fanout: 0,
+                },
+            )
+            .is_err()
+    );
+    let mut drained = false;
+    for _ in 0..4 {
+        match proactor.shutdown() {
+            Ok(()) => {
+                drained = true;
+                break;
+            }
+            Err(UringError::Wait(libc::EBUSY)) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert!(
+        drained,
+        "bounded shutdown retries did not retire all operations"
+    );
+    assert_eq!(*counts.borrow(), [0; 3]);
+    Ok(())
+}
+
+#[test]
+fn integration_scenario_rejects_cqe_suppression_and_message_ring_in_both_paths() -> TestResult {
+    let mut proactor = Proactor::new(config(false))?;
+    for skip_completion in [false, true] {
+        let rejected = proactor.prepare_sqe_with(op(1, 1), |sqe| {
+            // SAFETY: The callback owns initialized exclusive SQE storage.
+            unsafe {
+                if skip_completion {
+                    (*sqe).flags = liburing_sys::IOSQE_CQE_SKIP_SUCCESS as u8;
+                } else {
+                    (*sqe).opcode = liburing_sys::IORING_OP_MSG_RING as u8;
+                }
+            }
+        });
+        assert!(matches!(rejected, Err(UringError::InvalidConfig(_))));
+    }
+    proactor.alloc_sqe(op(1, 2))?;
+    let mut observed = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while observed.len() < 2 && Instant::now() < deadline {
+        wait_timeout(&mut proactor, Duration::from_millis(100), |cqe, context| {
+            observed.push(cqe.op_id);
+            if cqe.op_id == op(1, 2) {
+                let available = context.remaining_capacity();
+                for skip_completion in [false, true] {
+                    let rejected = context.prepare_sqe_with(op(1, 3), |sqe| {
+                        // SAFETY: The callback owns initialized exclusive SQE storage.
+                        unsafe {
+                            if skip_completion {
+                                (*sqe).flags = liburing_sys::IOSQE_CQE_SKIP_SUCCESS as u8;
+                            } else {
+                                (*sqe).opcode = liburing_sys::IORING_OP_MSG_RING as u8;
+                            }
+                        }
+                    });
+                    assert!(matches!(rejected, Err(UringError::InvalidConfig(_))));
+                    assert_eq!(context.remaining_capacity(), available);
+                }
+                context.prepare_sqe_with(op(1, 4), |sqe| {
+                    // SAFETY: The callback owns initialized exclusive SQE storage.
+                    unsafe { prep_nop(sqe) };
+                })?;
+            }
+            Ok(())
+        })?;
+    }
+    assert_eq!(observed, vec![op(1, 2), op(1, 4)]);
+    proactor.shutdown()?;
+    Ok(())
+}

@@ -14,7 +14,10 @@ use crate::{
     config::{KernelFeatures, ProactorConfig},
     error::{Result, UringError},
     id::{OpId, OpPayload, SubsystemId},
-    subsystem::{Completion, StagedSqe, SubmissionContext, SubsystemHandler, SubsystemRegistry},
+    subsystem::{
+        Completion, StagedSqe, SubmissionContext, SubsystemHandler, SubsystemRegistry,
+        validate_prepared_sqe,
+    },
     waker::ProactorWaker,
 };
 
@@ -40,6 +43,7 @@ pub struct Proactor {
     in_cqe_dispatch: bool,
     staged_sqes: VecDeque<StagedSqe>,
     pending_operations: usize,
+    shutdown_started: bool,
     ring_closed: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
@@ -120,6 +124,7 @@ impl Proactor {
             in_cqe_dispatch: false,
             staged_sqes: VecDeque::with_capacity(capacity),
             pending_operations: 0,
+            shutdown_started: false,
             ring_closed: false,
             _thread_bound: PhantomData,
         };
@@ -132,7 +137,7 @@ impl Proactor {
 
     /// Returns the owned ring pointer for explicit FFI integration.
     ///
-    /// Returns null after successful shutdown. Dereferencing a nonnull pointer
+    /// Returns null after shutdown starts. Dereferencing a nonnull pointer
     /// requires preserving exclusive ring access and
     /// keeping every submitted resource alive until its final completion.
     /// Use this pointer for resource registration only. Preparing, submitting,
@@ -142,7 +147,7 @@ impl Proactor {
     /// # Panics
     /// Does not panic.
     pub fn ring_mut(&mut self) -> *mut sys::io_uring {
-        if self.ring_closed {
+        if self.shutdown_started {
             std::ptr::null_mut()
         } else {
             self.ring.as_mut()
@@ -168,7 +173,8 @@ impl Proactor {
     /// Registers a handler for one application subsystem identifier.
     ///
     /// # Errors
-    /// Returns an error for an internal or already occupied identifier.
+    /// Returns an error for an internal or already occupied identifier, or after
+    /// shutdown starts.
     ///
     /// # Panics
     /// Does not panic.
@@ -177,6 +183,7 @@ impl Proactor {
         id: SubsystemId,
         handler: H,
     ) -> Result<()> {
+        self.ensure_open()?;
         self.registry.register(id, handler)
     }
 
@@ -190,7 +197,7 @@ impl Proactor {
     /// # Errors
     /// Returns `SqRingFull` when both the SQ and bounded staging queue are full,
     /// rejects internal identifiers and the reserved `u64::MAX` timeout sentinel,
-    /// and rejects closed rings.
+    /// completion-skipping and message-ring operations, and shutting-down rings.
     ///
     /// # Panics
     /// Propagates a panic from `prepare` without publishing its partial SQE.
@@ -218,6 +225,7 @@ impl Proactor {
         // SAFETY: A zeroed SQE is initialized C storage; the callback sets its operation.
         let mut sqe = unsafe { std::mem::zeroed::<sys::io_uring_sqe>() };
         prepare(&mut sqe);
+        validate_prepared_sqe(&sqe)?;
         sqe.user_data = op_id.raw();
         if !self.in_cqe_dispatch && self.staged_sqes.is_empty() && self.copy_to_sq(&sqe) {
             return Ok(());
@@ -437,7 +445,8 @@ impl Proactor {
     ///
     /// Staged operations are discarded without entering the kernel. Shutdown
     /// never invokes subsystem callbacks. It performs at most 32 bounded waits
-    /// of ten milliseconds; retrying after an error continues draining.
+    /// of ten milliseconds; retrying after an error continues draining. Once
+    /// shutdown starts, application submissions and completion dispatch stop.
     ///
     /// # Errors
     /// Returns cancellation, submission, or drain errors. A failed shutdown does
@@ -452,6 +461,7 @@ impl Proactor {
         if self.ring_closed {
             return Ok(());
         }
+        self.shutdown_started = true;
         if let Some(waker) = &self.waker {
             waker.close();
         }
@@ -542,8 +552,8 @@ impl Proactor {
     }
 
     fn ensure_open(&self) -> Result<()> {
-        if self.ring_closed {
-            return Err(UringError::InvalidConfig("ring has been shut down"));
+        if self.shutdown_started {
+            return Err(UringError::InvalidConfig("ring shutdown has started"));
         }
         Ok(())
     }
