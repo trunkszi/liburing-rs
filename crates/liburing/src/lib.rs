@@ -5,8 +5,11 @@
 
 pub mod config;
 pub mod error;
+pub mod fixed_buffers;
+pub mod fixed_files;
 pub mod id;
 pub mod ops;
+pub mod pbuf_ring;
 pub mod proactor;
 pub mod subsystem;
 pub mod waker;
