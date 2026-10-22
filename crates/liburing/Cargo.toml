@@ -18,6 +18,7 @@ libc = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+liburing-macros = { workspace = true }
 static_assertions = { workspace = true }
 
 [lints]

@@ -98,6 +98,15 @@ if errors:
 print('Source and manifest invariants passed')
 PY
 
+# Examples exercise the real kernel even when no package was selected by the diff.
+run_examples() {
+  cargo build -p liburing --examples
+  for example in proactor_subsystems_and_waker fixed_files_and_pbuf_tcp_echo socket_bridge_readiness; do
+    echo "Running example: $example"
+    timeout 30s cargo run -p liburing --example "$example"
+  done
+}
+
 run_all=0
 case "${GITHUB_EVENT_NAME:-}" in schedule|workflow_dispatch) run_all=1 ;; esac
 declare -A affected=()
@@ -130,7 +139,8 @@ for package in "${packages[@]}"; do
   fi
 done
 if [ "${#selected[@]}" -eq 0 ]; then
-  echo 'No Cargo packages affected'
+  echo 'No Cargo packages affected; validating all examples'
+  run_examples
   exit 0
 fi
 cargo fmt --all -- --check
@@ -171,4 +181,5 @@ PY
     rm "$artifacts"
   done
 fi
+run_examples
 echo "Incremental CI passed: ${selected[*]}"

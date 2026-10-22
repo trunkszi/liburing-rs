@@ -23,6 +23,13 @@ Before editing, inspect staged and unstaged differences in each target file and
 preserve concurrent work. Commit or publish only when requested. Stage explicit
 paths belonging to the authorized change.
 
+## Workspace Layout
+
+Runtime source is in `crates/liburing/src/`, integration targets are in
+`crates/liburing/tests/`, and runnable local applications are in
+`crates/liburing/examples/`. For example changes, verify the corresponding
+README command and keep descriptor/DMA owners alive through their final CQEs.
+
 ## Runtime Contracts
 
 - `Proactor` and ring-owned resources remain on their creating thread.
@@ -59,9 +66,9 @@ submission or dispatch. Read `socket_bridge.rs` and `UringSocketOps` before
 changing external socket integration. Follow fixed-buffer and provided-buffer
 ownership from preparation through final CQE before changing cancellation.
 
-The four-pillar composition model is described in README. Keep implemented
-contracts distinct from higher-level goals such as unified timers, automatic
-unregister quarantine, a shared operation slot table, and batch callbacks.
+Public composition uses the proactor, socket bridge, buffer ownership helpers,
+and command queue. Unified timers, automatic unregister quarantine, a shared
+operation slot table, and batch callbacks remain higher-level design goals.
 
 ## Native Build and Features
 
@@ -105,6 +112,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace --no-default-features --features stable
+cargo run -p liburing --example proactor_subsystems_and_waker
+cargo run -p liburing --example fixed_files_and_pbuf_tcp_echo
+cargo run -p liburing --example socket_bridge_readiness
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 bash .github/scripts/ci-incremental.sh
 ```
@@ -118,3 +128,8 @@ operations. Distinguish skipped kernel-dependent assertions from executed tests.
 Report actual commands, results, and uncovered boundaries. End with
 `git diff --check` and a review of the changed paths. Pure documentation edits
 need factual, reference, and diff checks rather than a full native rebuild.
+
+The incremental gate builds and runs all three examples on every invocation,
+including when the package selection is empty. Example ring initialization and
+missing kernel capabilities must fail visibly. Use bounded completion waits;
+run examples before reporting an example change complete.

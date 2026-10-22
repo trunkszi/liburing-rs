@@ -50,6 +50,14 @@ pub struct Proactor {
 }
 
 impl Proactor {
+    /// Starts configuring a ring with the default capacities and options.
+    ///
+    /// # Panics
+    /// Does not panic.
+    pub fn builder() -> crate::ProactorBuilder {
+        ProactorConfig::builder()
+    }
+
     /// Creates a ring, retrying unsupported optional setup flags individually.
     ///
     /// # Errors
