@@ -1,0 +1,24 @@
+[package]
+name = "liburing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Single-threaded io_uring proactor with subsystem dispatch and cross-thread wakeups"
+
+[features]
+default = ["pre-release"]
+pre-release = ["liburing-sys/pre-release"]
+stable = ["liburing-sys/stable"]
+
+[dependencies]
+liburing-sys.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+static_assertions.workspace = true
+
+[lints]
+workspace = true
