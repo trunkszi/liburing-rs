@@ -1,4 +1,4 @@
-//! Kernel integration scenarios for reentrant submission and resource recovery.
+//! Completion routing and kernel scenarios for reentrant I/O and resource recovery.
 #![cfg(target_os = "linux")]
 
 use std::{
@@ -742,5 +742,58 @@ fn integration_lifecycle_scenario_socket_bridge_maps_native_poll_and_close_opera
     assert_eq!(records.borrow().len(), 6);
     assert!(queue.borrow().is_empty());
     proactor.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn unit_lifecycle_scenario_bridge_multishot_routing_and_interest_aba() -> TestResult {
+    let id = route(3);
+    let queue = Rc::new(RefCell::new(std::collections::VecDeque::new()));
+    let ops = KernelBridgeOps {
+        id,
+        queue: Rc::clone(&queue),
+    };
+    let mut bridge = UringSocketBridge::new(id, ops, 1)?;
+    bridge.register(7)?;
+    bridge.set_interest(7, SocketInterest::READABLE)?;
+    let op_id = queue.borrow()[0].0;
+    let cqe = |op_id, result, flags| Completion {
+        op_id,
+        result,
+        flags,
+    };
+    let foreign = OpId::pack(route(2), op_id.payload());
+    assert_eq!(bridge.on_completion(cqe(foreign, 1, 0)), None);
+    for result in [1, 0x10, -libc::ECONNRESET] {
+        let event = bridge
+            .on_completion(cqe(op_id, result, sys::IORING_CQE_F_MORE))
+            .expect("active multishot token routes");
+        assert_eq!((event.fd, event.result), (7, result));
+        assert!(event.interest.contains(SocketInterest::READABLE));
+        assert_eq!(
+            event.interest.contains(SocketInterest::WRITABLE),
+            result != 1
+        );
+        bridge.drive()?;
+        assert_eq!(queue.borrow().len(), 1);
+    }
+    assert!(bridge.on_completion(cqe(op_id, 1, 0)).is_some());
+    bridge.drive()?;
+    let replacement = queue.borrow()[1].0;
+    bridge.set_interest(7, SocketInterest::WRITABLE)?;
+    bridge.set_interest(7, SocketInterest::READABLE)?;
+    let removal = queue.borrow()[2].0;
+    bridge
+        .on_completion(cqe(removal, -libc::ENOMEM, 0))
+        .expect("failed removal retires its control");
+    bridge.drive()?;
+    assert_eq!(queue.borrow().len(), 4);
+    let stale = bridge
+        .on_completion(cqe(replacement, i32::from(libc::POLLIN), 0))
+        .expect("superseded poll retires");
+    assert!(
+        stale.interest.is_empty(),
+        "superseded poll signalled after interest ABA"
+    );
     Ok(())
 }

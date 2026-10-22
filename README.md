@@ -126,8 +126,9 @@ closing or recycling a descriptor referenced by submitted work.
 access to a selected payload and republishes that buffer on release or drop.
 After a terminal `-ENOBUFS` CQE, call `mark_depleted_recv(fd, flags, op_id)`
 to park that receive. Returning leases restores buffer availability. Drive
-`rearm_depleted_recvs` with a staging callback: the helper detects buffer returns
-since depletion and supplies each eligible receive's fd, message flags, operation
+`rearm_depleted_recvs` with a staging callback: the helper detects available
+buffers, including leases returned earlier in the CQE batch, and supplies each
+eligible receive's fd, message flags, operation
 ID, and buffer group. The callback stages exactly one multishot receive on success
 and nothing on failure; failed records stay pending for retry. Lease drop itself
 does not enter the kernel. Remove a parked receive with `forget_depleted_recv`
@@ -154,6 +155,9 @@ does not cancel or close them. A final close CQE retires the fd even on errors
 reported after close executes; retrying Linux close could affect a reused
 descriptor. A canceled close did not execute and can be staged again.
 Submission failures before close is staged remain retryable through `drive()`.
+Cancellation controls retain their target's lifetime. Failures other than the
+normal `-ENOENT`/`-EALREADY` completion races permit retry;
+superseded polls never emit readiness, even if the interest mask changes back.
 
 For c-ares, collect readiness events and advance the library with its fd-processing
 entry point. Compute its retry deadline and use a bounded wait so it can advance
@@ -219,6 +223,8 @@ routes with 32 reads and 32 writes each; and four external producers delivering
 must remain lossless. Kernel capability skips are distinct from executed coverage.
 The target also checks native socket poll replacement, readiness decoding, and
 cancellation before deferred close through `UringSocketBridge`.
+A unit scenario in the same target checks multishot routing and stale readiness
+after interest-mask changes.
 
 ## License
 

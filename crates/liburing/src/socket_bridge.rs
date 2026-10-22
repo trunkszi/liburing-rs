@@ -108,7 +108,7 @@ pub enum BridgeSubmission<Id> {
     Close { fd: RawFd },
 }
 
-/// Submission boundary between the bridge and a registered subsystem handle.
+/// Submission boundary between the bridge and a registered subsystem submitter.
 ///
 /// A successful submission must reserve its slot and retain any DMA resources
 /// through the target's final CQE. An error must stage nothing. `PollRemove` and
@@ -116,6 +116,7 @@ pub enum BridgeSubmission<Id> {
 /// `Close` must stage a close operation without synchronously recycling the fd.
 /// Adapters must preserve `local_token` in their completion routing and isolate
 /// it from any other local-token namespace used by the same subsystem.
+/// IDs remain unique until their target and referencing controls have retired.
 pub trait UringSocketOps {
     type OpId: Copy + Eq;
     type Error;
@@ -182,9 +183,11 @@ struct Socket {
 struct Pending<Id> {
     token: u64,
     id: Id,
+    target: Option<Id>,
     socket: usize,
     kind: BridgeOpKind,
     interest: SocketInterest,
+    superseded: bool,
     remove_requested: bool,
     cancel_requested: bool,
 }
@@ -193,7 +196,7 @@ struct Pending<Id> {
 ///
 /// The adapter and bridge must remain alive until every registered socket has
 /// completed close. Dropping this value does not cancel or close descriptors;
-/// subsystem quarantine remains the proactor's responsibility. Capacity is
+/// the caller must drain operations before unregistering its handler. Capacity is
 /// allocated at construction; bridge transitions do not allocate.
 pub struct UringSocketBridge<O: UringSocketOps> {
     subsystem: SubsystemId,
@@ -365,9 +368,7 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
         }
         let interest = match op.kind {
             BridgeOpKind::PollAdd
-                if !socket.closing
-                    && op.interest == socket.interest
-                    && !(result == -libc::ECANCELED && op.remove_requested) =>
+                if !socket.closing && op.interest == socket.interest && !op.superseded =>
             {
                 SocketInterest::completion(result)
             }
@@ -380,15 +381,21 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
             }
             _ => SocketInterest::EMPTY,
         };
-        if op.kind == BridgeOpKind::PollRemove
-            && !more
+        if !more
             && result < 0
             && result != -libc::ENOENT
             && result != -libc::EALREADY
-            && let Some(target) = self.operation(op.socket, BridgeOpKind::PollAdd)
-            && let Some(target) = &mut self.pending[target]
+            && let Some(target) = self
+                .pending
+                .iter_mut()
+                .flatten()
+                .find(|pending| Some(pending.id) == op.target)
         {
-            target.remove_requested = false;
+            match op.kind {
+                BridgeOpKind::PollRemove => target.remove_requested = false,
+                BridgeOpKind::Cancel => target.cancel_requested = false,
+                _ => {}
+            }
         }
         if op.kind == BridgeOpKind::Close && !more && result != -libc::ECANCELED {
             self.sockets[op.socket] = None;
@@ -469,9 +476,15 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
         self.pending[index] = Some(Pending {
             token,
             id,
+            target: match submission {
+                BridgeSubmission::PollRemove { target, .. }
+                | BridgeSubmission::Cancel { target, .. } => Some(target),
+                _ => None,
+            },
             socket,
             kind,
             interest,
+            superseded: false,
             remove_requested: false,
             cancel_requested: false,
         });
@@ -516,9 +529,12 @@ impl<O: UringSocketOps> UringSocketBridge<O> {
             }
         } else if let Some(target_index) = self.operation(index, BridgeOpKind::PollAdd)
             && let Some(target) = self.pending[target_index]
-            && target.interest != socket.interest
+            && (target.interest != socket.interest || target.superseded)
             && !target.remove_requested
         {
+            if let Some(target) = &mut self.pending[target_index] {
+                target.superseded = true;
+            }
             self.stage(
                 index,
                 BridgeSubmission::PollRemove {
@@ -559,7 +575,6 @@ mod unit_lifecycle_scenario {
     };
 
     use super::*;
-    use crate::OpId;
 
     const SUBSYSTEM: SubsystemId = SubsystemId(9);
     type Requests = Rc<RefCell<Vec<(u64, BridgeSubmission<u64>)>>>;
@@ -676,27 +691,37 @@ mod unit_lifecycle_scenario {
             h.bridge.close(7)?;
             h.bridge.close(7)?;
             assert_eq!(h.count(), 5);
+            h.complete(3, -libc::ENOMEM);
+            h.bridge.drive()?;
+            assert_eq!(h.count(), 6);
+            assert_eq!(
+                h.requests.borrow()[5].1,
+                BridgeSubmission::Cancel {
+                    fd: 7,
+                    target: h.token(0) + 1024,
+                }
+            );
             assert_eq!(
                 h.bridge.set_interest(7, SocketInterest::WRITABLE),
                 Err(BridgeError::Closing)
             );
             let order = if control_first {
-                [2, 3, 4, 0, 1]
+                [2, 5, 4, 0, 1]
             } else {
-                [0, 1, 2, 3, 4]
+                [0, 1, 2, 5, 4]
             };
             for (position, index) in order.into_iter().enumerate() {
-                h.complete(index, -125);
+                h.complete(index, if index < 2 { -libc::ECANCELED } else { 0 });
                 h.bridge.drive()?;
-                assert_eq!(h.count(), if position == 4 { 6 } else { 5 });
+                assert_eq!(h.count(), if position == 4 { 7 } else { 6 });
             }
-            assert_eq!(h.requests.borrow()[5].1, BridgeSubmission::Close { fd: 7 });
+            assert_eq!(h.requests.borrow()[6].1, BridgeSubmission::Close { fd: 7 });
             assert_eq!(h.bridge.register(7), Err(BridgeError::AlreadyRegistered));
-            h.complete(5, 0);
+            h.complete(6, 0);
             h.bridge.register(7)?;
             h.bridge.set_interest(7, SocketInterest::READABLE)?;
             assert_eq!(h.bridge.on_cqe(h.token(0), 1, false), None);
-            assert_eq!(h.count(), 7);
+            assert_eq!(h.count(), 8);
         }
         Ok(())
     }
@@ -714,64 +739,23 @@ mod unit_lifecycle_scenario {
         h.bridge.drive()?;
         assert_eq!(h.token(0), 1);
         h.bridge.close(7)?;
-        h.complete(1, -2);
+        h.complete(1, -libc::ENOMEM);
         h.bridge.drive()?;
-        assert_eq!(h.count(), 2);
+        assert_eq!(h.count(), 3, "failed cancellation must be retried");
+        h.complete(2, -libc::ENOENT);
+        h.bridge.drive()?;
+        assert_eq!(h.count(), 3);
         h.complete(0, -125);
         h.fail.set(true);
         assert_eq!(h.bridge.drive(), Err(BridgeError::Submission("queue full")));
         h.bridge.drive()?;
-        h.complete(2, -libc::ECANCELED);
+        h.complete(3, -libc::ECANCELED);
         h.bridge.drive()?;
-        assert_eq!(h.count(), 4);
-        h.complete(3, -5);
+        assert_eq!(h.count(), 5);
+        h.complete(4, -5);
         h.bridge.drive()?;
-        assert_eq!(h.count(), 4);
+        assert_eq!(h.count(), 5);
         h.bridge.register(7)?;
-        Ok(())
-    }
-
-    #[test]
-    fn multishot_readiness_and_routing_preserve_kernel_errors()
-    -> Result<(), BridgeError<&'static str>> {
-        let mut h = Harness::new()?;
-        h.bridge.register(7)?;
-        h.bridge.set_interest(7, SocketInterest::READABLE)?;
-        let payload = OpPayload(h.token(0));
-        assert_eq!(
-            h.bridge.on_completion(Completion {
-                op_id: OpId::pack(SubsystemId(10), payload),
-                result: 1,
-                flags: 0,
-            }),
-            None
-        );
-        for result in [1, 0x10, -104] {
-            let event = h.bridge.on_completion(Completion {
-                op_id: OpId::pack(SUBSYSTEM, payload),
-                result,
-                flags: 2,
-            });
-            let interest = if result == 1 {
-                SocketInterest::READABLE
-            } else {
-                SocketInterest::READABLE | SocketInterest::WRITABLE
-            };
-            assert_eq!(
-                event,
-                Some(BridgeEvent {
-                    fd: 7,
-                    interest,
-                    result,
-                    kind: BridgeOpKind::PollAdd
-                })
-            );
-            h.bridge.drive()?;
-            assert_eq!(h.count(), 1);
-        }
-        h.complete(0, 1);
-        h.bridge.drive()?;
-        assert_eq!(h.count(), 2);
         Ok(())
     }
 
