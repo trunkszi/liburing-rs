@@ -443,17 +443,20 @@ impl Proactor {
 
     /// Cancels outstanding operations and waits for their own final completions.
     ///
-    /// Staged operations are discarded without entering the kernel. Shutdown
-    /// never invokes subsystem callbacks. It performs at most 32 bounded waits
-    /// of ten milliseconds; retrying after an error continues draining. Once
-    /// shutdown starts, application submissions and completion dispatch stop.
+    /// Staged operations are discarded without entering the kernel. Registered
+    /// subsystem handlers still receive their completions to release resources,
+    /// with a zero-capacity submission context that rejects all follow-up work.
+    /// Preparation returns `SqRingFull` without invoking the preparation closure.
+    /// It performs at most 32 bounded waits of ten milliseconds; retrying after
+    /// an error continues draining. Application submissions stop immediately.
     ///
     /// # Errors
-    /// Returns cancellation, submission, or drain errors. A failed shutdown does
-    /// not establish permission to free externally submitted DMA resources.
+    /// Returns cancellation, submission, drain, or handler errors. A failed
+    /// shutdown does not establish permission to free external DMA resources.
     ///
     /// # Panics
-    /// Does not panic.
+    /// Propagates a handler panic after restoring the dispatch guard. Its CQE
+    /// remains consumed; a subsequent shutdown call continues draining.
     pub fn shutdown(&mut self) -> Result<()> {
         if self.in_cqe_dispatch {
             return Err(UringError::ReentrantDispatch);
@@ -544,11 +547,40 @@ impl Proactor {
                 if result < 0 && result != -libc::ENOENT && result != -libc::EALREADY {
                     return Err(UringError::Wait(-result));
                 }
-            } else if flags & sys::IORING_CQE_F_MORE == 0 {
+                continue;
+            }
+            if flags & sys::IORING_CQE_F_MORE == 0 {
                 self.pending_operations = self.pending_operations.saturating_sub(1);
             }
+            let op_id = OpId::from_raw(id);
+            if op_id == INTERNAL_POLL {
+                self.waker_poll_armed = false;
+                continue;
+            }
+            self.dispatch_shutdown_completion(Completion {
+                op_id,
+                result,
+                flags,
+            })?;
         }
         Ok(())
+    }
+
+    fn dispatch_shutdown_completion(&mut self, completion: Completion) -> Result<()> {
+        if !self.registry.contains(completion.op_id.subsystem_id()) {
+            return Ok(());
+        }
+        self.in_cqe_dispatch = true;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut context = SubmissionContext::new(&mut self.staged_sqes, 0);
+            self.registry.dispatch(completion, &mut context)
+        }));
+        self.in_cqe_dispatch = false;
+        self.staged_sqes.clear();
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn ensure_open(&self) -> Result<()> {

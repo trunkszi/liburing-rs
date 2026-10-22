@@ -117,22 +117,22 @@ pub unsafe fn prep_recv(sqe: *mut io_uring_sqe, fd: RawFd, buf: *mut u8, len: us
 ///
 /// # Safety
 /// `sqe` must point to one initialized, exclusively owned, writable SQE that
-/// has not been published. `group` must remain registered with available buffer descriptors. Each
-/// selected buffer stays unavailable to the caller until its CQE grants
-/// exclusive access; retain the group through the receive final CQE.
+/// has not been published. `group` must remain registered through the receive
+/// final CQE; an empty group may complete with `-ENOBUFS`. Each selected buffer
+/// stays unavailable to the caller until its CQE grants exclusive access.
 pub unsafe fn prep_recv_multishot(
     sqe: *mut io_uring_sqe,
     fd: RawFd,
     group: BufGroupId,
     flags: i32,
 ) {
-    // SAFETY: SQE storage is exclusively writable and unpublished. All three
-    // helpers modify that SQE only; the caller retains the registered group
+    // SAFETY: SQE storage is exclusively writable and unpublished. These writes
+    // modify that SQE only; the caller retains the registered group
     // through the multishot receive final CQE and owns each returned lease.
     unsafe {
         liburing_sys::uring_shim_prep_recv_multishot(sqe, fd, std::ptr::null_mut(), 0, flags);
         liburing_sys::uring_shim_sqe_set_buf_group(sqe, group.raw());
-        liburing_sys::uring_shim_sqe_set_flags(sqe, 1_u32 << liburing_sys::IOSQE_BUFFER_SELECT_BIT);
+        (*sqe).flags |= liburing_sys::IOSQE_BUFFER_SELECT as u8;
     }
 }
 

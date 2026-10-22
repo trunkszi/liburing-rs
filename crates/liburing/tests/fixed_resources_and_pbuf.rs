@@ -1,22 +1,28 @@
 //! Real-kernel resource lifecycle scenarios; no external service is substituted.
 
 use std::{
+    cell::Cell,
     fs::File,
-    io,
+    io::{self, Read},
     mem::{ManuallyDrop, MaybeUninit},
-    net::UdpSocket,
+    net::{TcpListener, TcpStream, UdpSocket},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{fs::FileExt, net::UnixStream},
     },
+    rc::Rc,
+    time::Duration,
 };
 
 use liburing::{
+    ProactorConfig, UringError,
     fixed_buffers::FixedBufferPool,
     fixed_files::FixedFileTable,
-    id::{BufGroupId, OpId},
+    id::{BufGroupId, OpId, OpPayload, SubsystemId},
     ops::net,
     pbuf_ring::ProvidedBufRing,
+    proactor::Proactor,
+    subsystem::{Completion, SubmissionContext, SubsystemHandler},
 };
 
 struct KernelRing {
@@ -201,6 +207,7 @@ fn integration_lifecycle_scenario_cancel_retains_dma_until_target_final_cqe()
     let id = bytes.id();
     let address = bytes.as_mut_ptr();
     let mut waiting = bytes.into_in_flight();
+    let generation = waiting.generation();
     let sqe = ring.sqe(11);
     // SAFETY: The registered buffer is exclusively retained by waiting; the
     // socket is kept open and empty to leave this read pending until cancellation.
@@ -241,7 +248,7 @@ fn integration_lifecycle_scenario_cancel_retains_dma_until_target_final_cqe()
     assert!(target_final && cancel_completed);
     // SAFETY: Both CQEs were observed, including the original read's final
     // -ECANCELED CQE; no notification or further DMA can follow this read.
-    unsafe { pool.reclaim_completed(id)? };
+    unsafe { pool.reclaim_completed_generation(id, generation)? };
     let bytes = pool.checkout()?;
     assert_eq!(bytes.id(), id);
     drop(waiting);
@@ -253,6 +260,165 @@ fn integration_lifecycle_scenario_cancel_retains_dma_until_target_final_cqe()
     drop(bytes);
     assert_eq!(pool.available(), 1);
     pool.unregister()?;
+    Ok(())
+}
+
+#[test]
+fn unit_scenario_multishot_preparation_preserves_existing_flags() {
+    // SAFETY: SQEs are plain C storage; this one is never submitted to a kernel.
+    let mut sqe: liburing_sys::io_uring_sqe = unsafe { std::mem::zeroed() };
+    let original =
+        liburing_sys::IOSQE_FIXED_FILE | liburing_sys::IOSQE_IO_LINK | liburing_sys::IOSQE_ASYNC;
+    sqe.flags = original as u8;
+    // SAFETY: The writable SQE is private and never submitted, so no descriptor
+    // or group is accessed by the kernel during this preparation-only test.
+    unsafe { net::prep_recv_multishot(&mut sqe, 0, BufGroupId(9), 0) };
+    assert_eq!(
+        u32::from(sqe.flags),
+        original | liburing_sys::IOSQE_BUFFER_SELECT
+    );
+}
+
+struct ShutdownAcceptHandler {
+    calls: Rc<Cell<usize>>,
+    blocked: Rc<Cell<bool>>,
+}
+
+impl SubsystemHandler for ShutdownAcceptHandler {
+    fn on_completion(
+        &mut self,
+        completion: Completion,
+        submissions: &mut SubmissionContext<'_>,
+    ) -> liburing::Result<()> {
+        assert!(
+            completion.result >= 0,
+            "accept must complete before shutdown"
+        );
+        // SAFETY: This accept CQE transfers unique ownership of its returned fd.
+        let accepted = unsafe { TcpStream::from_raw_fd(completion.result) };
+        drop(accepted);
+        self.calls.set(self.calls.get() + 1);
+        assert_eq!(submissions.remaining_capacity(), 0);
+        let prepared = Cell::new(false);
+        let result = submissions.prepare_sqe_with(completion.op_id, |_| prepared.set(true));
+        assert_eq!(result, Err(UringError::SqRingFull));
+        self.blocked.set(!prepared.get());
+        Ok(())
+    }
+}
+
+#[test]
+fn integration_lifecycle_shutdown_delivers_accepted_fd_and_blocks_followups()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut proactor = Proactor::new(ProactorConfig {
+        entries: 8,
+        enable_optimizations: false,
+        enable_waker: false,
+        ..ProactorConfig::default()
+    })?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let mut client = TcpStream::connect(listener.local_addr()?)?;
+    client.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let calls = Rc::new(Cell::new(0));
+    let blocked = Rc::new(Cell::new(false));
+    let subsystem = SubsystemId::new_unchecked(37);
+    proactor.register_subsystem(
+        subsystem,
+        ShutdownAcceptHandler {
+            calls: Rc::clone(&calls),
+            blocked: Rc::clone(&blocked),
+        },
+    )?;
+    let id = OpId::pack(subsystem, OpPayload::new_unchecked(1));
+    proactor.prepare_sqe_with(id, |sqe| {
+        // SAFETY: The listener outlives shutdown; null address outputs are legal
+        // for accept and the handler takes ownership of every successful result.
+        unsafe {
+            net::prep_accept(
+                sqe,
+                listener.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                libc::SOCK_CLOEXEC,
+            )
+        };
+    })?;
+    proactor.submit()?;
+    // SAFETY: The initialized ring is exclusively owned; reading its descriptor
+    // does not submit or consume operations or change proactor accounting.
+    let fd = unsafe { (*proactor.ring_mut()).ring_fd };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll borrows one initialized descriptor record. This bounded wait
+    // is test-only and guarantees an accept CQE is ready before shutdown starts.
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1);
+    proactor.shutdown()?;
+    assert_eq!(calls.get(), 1);
+    assert!(blocked.get());
+    assert_eq!(
+        client.read(&mut [0_u8; 1])?,
+        0,
+        "accepted socket must close"
+    );
+    proactor.shutdown()?;
+    assert_eq!(calls.get(), 1, "shutdown must not redeliver a completion");
+    Ok(())
+}
+
+#[test]
+fn integration_scenario_oversized_selected_completion_republishes_buffer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut ring = KernelRing::new()?;
+    let receiver = UdpSocket::bind("127.0.0.1:0")?;
+    let sender = UdpSocket::bind("127.0.0.1:0")?;
+    sender.connect(receiver.local_addr()?)?;
+    // SAFETY: This stable ring exclusively owns group 9. ManuallyDrop retains
+    // storage on early failure; successful teardown follows both final CQEs.
+    let mut group =
+        ManuallyDrop::new(unsafe { ProvidedBufRing::new(ring.pointer(), 1, 8, BufGroupId(9))? });
+    for (id, payload) in [(41, b"one".as_slice()), (42, b"two".as_slice())] {
+        sender.send(payload)?;
+        let sqe = ring.sqe(id);
+        // SAFETY: The live socket and registered group outlive this one-shot
+        // receive. BUFFER_SELECT makes the null user buffer pointer unused.
+        unsafe {
+            liburing_sys::uring_shim_prep_recv(
+                sqe,
+                receiver.as_raw_fd(),
+                std::ptr::null_mut(),
+                8,
+                0,
+            );
+            liburing_sys::uring_shim_sqe_set_flags(sqe, liburing_sys::IOSQE_BUFFER_SELECT);
+            liburing_sys::uring_shim_sqe_set_buf_group(sqe, 9);
+        }
+        ring.submit()?;
+        let cqe = ring.completion()?;
+        assert_eq!((cqe.id, cqe.result), (id, 3));
+        assert_eq!(cqe.flags & liburing_sys::IORING_CQE_F_BUF_MORE, 0);
+        if id == 41 {
+            // SAFETY: This genuine CQE transfers exclusive ownership of the
+            // selected buffer. Only its reported size is fault-injected; the
+            // defensive branch must reject it without accessing that range.
+            let result = unsafe { group.lease_from_cqe(cqe.flags, 9) };
+            assert!(matches!(result, Err(UringError::InvalidConfig(_))));
+            assert_eq!(group.returned_count(), 1);
+        } else {
+            // SAFETY: This unconsumed final CQE grants exclusive ownership of
+            // the republished buffer; its real payload fits the allocation.
+            let lease = unsafe { group.lease_from_cqe(cqe.flags, cqe.result)? };
+            assert_eq!(&*lease, payload);
+            lease.release();
+        }
+    }
+    // SAFETY: Both one-shot receives delivered final CQEs and no lease remains.
+    unsafe {
+        group.unregister()?;
+        ManuallyDrop::drop(&mut group);
+    }
     Ok(())
 }
 

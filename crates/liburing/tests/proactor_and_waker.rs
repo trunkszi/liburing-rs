@@ -355,10 +355,15 @@ struct PendingReadOwner {
 }
 
 impl SubsystemHandler for PendingReadOwner {
-    fn on_completion(&mut self, _: Completion, _: &mut SubmissionContext<'_>) -> Result<()> {
-        Err(UringError::InvalidConfig(
-            "pending read completed before shutdown",
-        ))
+    fn on_completion(
+        &mut self,
+        completion: Completion,
+        submissions: &mut SubmissionContext<'_>,
+    ) -> Result<()> {
+        assert_eq!(completion.result, -libc::ECANCELED);
+        assert_eq!(completion.flags & liburing_sys::IORING_CQE_F_MORE, 0);
+        assert_eq!(submissions.remaining_capacity(), 0);
+        Ok(())
     }
 }
 
@@ -471,7 +476,13 @@ fn integration_lifecycle_scenario_failed_shutdown_allows_only_drain_retries() ->
         drained,
         "bounded shutdown retries did not retire all operations"
     );
-    assert_eq!(*counts.borrow(), [0; 3]);
+    assert_eq!(*counts.borrow(), [64, 0, 0]);
+    proactor.shutdown()?;
+    assert_eq!(
+        *counts.borrow(),
+        [64, 0, 0],
+        "no duplicate shutdown delivery"
+    );
     Ok(())
 }
 
