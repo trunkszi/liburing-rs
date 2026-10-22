@@ -65,6 +65,9 @@ pub enum UringError {
     /// A configuration value would violate ring or batching constraints.
     #[error("invalid proactor configuration: {0}")]
     InvalidConfig(&'static str),
+    /// Prepared SQE flags require guarantees that bounded staging cannot provide.
+    #[error("invalid prepared submission: {0}")]
+    InvalidPreparedSqe(&'static str),
     /// A callback attempted to harvest or submit while CQ dispatch was active.
     #[error("recursive completion dispatch or submission is forbidden")]
     ReentrantDispatch,

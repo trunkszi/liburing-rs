@@ -101,6 +101,9 @@ callback dispatch ends, staged SQEs move into available kernel slots in FIFO ord
 The application continues submitting and polling until pending work drains.
 Nested submission and completion dispatch are rejected with
 `UringError::ReentrantDispatch`.
+Linked SQEs (`IOSQE_IO_LINK` and `IOSQE_IO_HARDLINK`) are rejected with
+`UringError::InvalidPreparedSqe`: bounded staging can split submissions across
+kernel batches and does not preserve link-chain atomicity.
 
 `tick` submits and performs a nonblocking completion batch. `wait_completions`
 submits and waits for a minimum completion count or relative timeout. The
@@ -170,6 +173,9 @@ Submission failures before close is staged remain retryable through `drive()`.
 Cancellation controls retain their target's lifetime. Failures other than the
 normal `-ENOENT`/`-EALREADY` completion races permit retry;
 superseded polls never emit readiness, even if the interest mask changes back.
+Start `connect()` before installing readiness interest. A pending poll addition
+or removal causes `BridgeError::PollInFlight`; clear interest and retire those
+poll operations before retrying connect on the same socket.
 
 For c-ares, collect readiness events and advance the library with its fd-processing
 entry point. Compute its retry deadline and use a bounded wait so it can advance
@@ -232,7 +238,12 @@ callback; cancellation of 16 blocked fixed-buffer reads and delayed reuse;
 provided-buffer exhaustion and receive recovery; three interleaved subsystem
 routes with 32 reads and 32 writes each; and four external producers delivering
 2,500 commands each (10,000 total). Wakeups may coalesce; command delivery
-must remain lossless. Kernel capability skips are distinct from executed coverage.
+must remain lossless. After a wake, drain the mailbox until `pop()?` returns
+`None`, or use `CrossThreadCommandQueue::drain_with` to process the queued commands
+without holding the queue mutex during callbacks. The helper recovers a poisoned
+mutex so accepted commands can still be drained. Real ring creation is required;
+an unavailable or forbidden kernel ring fails the focused target instead of
+silently skipping its kernel scenarios.
 The target also checks native socket poll replacement, readiness decoding, and
 cancellation before deferred close through `UringSocketBridge`.
 A unit scenario in the same target checks multishot routing and stale readiness

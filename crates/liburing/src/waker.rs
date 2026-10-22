@@ -233,6 +233,10 @@ impl<T> CrossThreadCommandQueue<T> {
     /// Remove the oldest queued command, if present.
     ///
     /// Commands accepted before endpoint closure remain available to drain.
+    /// Wakeups coalesce, and the proactor consumes eventfd readiness separately
+    /// from commands. After each wake, call `pop` until it returns `Ok(None)`
+    /// (for example, `while let Some(command) = queue.pop()? { /* handle */ }`)
+    /// or use [`Self::drain_with`]; consuming only one command can strand others.
     ///
     /// # Errors
     /// Returns a structured error if the queue mutex was poisoned.
@@ -242,6 +246,38 @@ impl<T> CrossThreadCommandQueue<T> {
     pub fn pop(&self) -> Result<Option<T>> {
         let mut commands = self.state.commands.lock().map_err(|_| poisoned_queue())?;
         Ok(commands.pop_front())
+    }
+
+    /// Consume commands in FIFO order until the queue is observed empty.
+    ///
+    /// Calls `f` without holding the queue mutex, so it may enqueue follow-up
+    /// commands. These commands are also consumed before returning if no empty
+    /// queue is observed first. Continuous producers can keep this call running.
+    /// Returns the number of commands delivered to `f`.
+    ///
+    /// # Errors
+    /// This function does not return errors. It recovers a poisoned mutex to
+    /// drain the still-valid queue; it does not clear the poison flag.
+    ///
+    /// # Panics
+    /// Propagates a panic from `f`. Its command has been removed; later commands
+    /// remain queued, and the callback cannot poison the queue mutex.
+    pub fn drain_with<F: FnMut(T)>(&self, mut f: F) -> usize {
+        let mut count = 0;
+        loop {
+            let command = {
+                let mut commands = match self.state.commands.lock() {
+                    Ok(commands) => commands,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                commands.pop_front()
+            };
+            let Some(command) = command else {
+                return count;
+            };
+            f(command);
+            count += 1;
+        }
     }
 
     /// Return the queue's fixed number of command slots.
@@ -293,6 +329,64 @@ fn last_errno() -> i32 {
 #[cfg(test)]
 mod integration_lifecycle_scenario_tests {
     use super::*;
+
+    #[test]
+    fn drain_consumes_coalesced_commands_and_reentrant_pushes_in_fifo_order() -> Result<()> {
+        let waker = ProactorWaker::new()?;
+        let queue = CrossThreadCommandQueue::new(2, waker.clone());
+        queue.push(1)?;
+        queue.push(2)?;
+        waker.drain()?;
+        let mut received = Vec::new();
+        let mut push_error = None;
+        let count = queue.drain_with(|command| {
+            received.push(command);
+            if command == 1 {
+                push_error = queue.push(3).err();
+            }
+        });
+        assert_eq!(push_error, None);
+        assert_eq!(received, [1, 2, 3]);
+        assert_eq!(count, 3);
+        assert!(queue.is_empty()?);
+        assert_eq!(
+            queue.drain_with(|_| panic!("empty queue invoked callback")),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_callback_panic_preserves_remaining_commands_and_mutex() -> Result<()> {
+        let queue = CrossThreadCommandQueue::new(2, ProactorWaker::new()?);
+        queue.push(1)?;
+        queue.push(2)?;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.drain_with(|_| panic!("controlled command callback panic"))
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(queue.pop()?, Some(2));
+        queue.push(3)?;
+        assert_eq!(queue.pop()?, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn drain_recovers_commands_from_poisoned_mutex() -> Result<()> {
+        let queue = CrossThreadCommandQueue::new(1, ProactorWaker::new()?);
+        queue.push(7)?;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _commands = queue.state.commands.lock();
+            panic!("controlled queue mutex poison");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(queue.pop(), Err(poisoned_queue()));
+        let mut received = Vec::new();
+        assert_eq!(queue.drain_with(|command| received.push(command)), 1);
+        assert_eq!(received, [7]);
+        assert_eq!(queue.drain_with(drop), 0);
+        Ok(())
+    }
 
     #[test]
     fn bounded_queue_preserves_order_and_drains_after_endpoint_closure() -> Result<()> {

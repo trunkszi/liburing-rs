@@ -4,7 +4,7 @@
 use std::{
     cell::RefCell,
     collections::HashSet,
-    io,
+    io::{self, Read},
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
     rc::Rc,
     sync::{Arc, Barrier},
@@ -26,14 +26,12 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn blocking_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [-1; 2];
-    // SAFETY: `fds` contains two writable integers; pipe2 initializes both on
-    // success. O_CLOEXEC does not make the read end nonblocking.
+    // SAFETY: pipe2 initializes both writable slots; O_CLOEXEC leaves reads blocking.
     let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: successful pipe2 returned two distinct, newly owned descriptors.
-    // Each is transferred exactly once and closes automatically on drop.
+    // SAFETY: Each distinct descriptor from pipe2 transfers ownership exactly once.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
@@ -46,27 +44,14 @@ fn assert_before_deadline(started: Instant, scenario: &str) {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-fn kernel_proactor(waker: bool) -> Result<Option<Proactor>, UringError> {
-    let config = ProactorConfig {
+fn kernel_proactor(waker: bool) -> Result<Proactor, UringError> {
+    Proactor::new(ProactorConfig {
         entries: SQ_DEPTH,
         staged_capacity: 1024,
         max_cqe_batch: 256,
         enable_waker: waker,
         ..ProactorConfig::default()
-    };
-    match Proactor::new(config) {
-        Ok(proactor) => Ok(Some(proactor)),
-        Err(UringError::RingInit(errno))
-            if matches!(errno.abs(), libc::EPERM | libc::EACCES | libc::ENOSYS) =>
-        {
-            eprintln!(
-                "kernel integration unavailable: io_uring_setup errno {}",
-                errno.abs()
-            );
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+    })
 }
 
 fn route(id: u8) -> SubsystemId {
@@ -96,9 +81,17 @@ impl SubsystemHandler for Recorder {
 
 #[test]
 fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -> TestResult {
-    let Some(mut proactor) = kernel_proactor(false)? else {
-        return Ok(());
+    static BYTES: [u8; REENTRANT_OPERATIONS] = {
+        let mut bytes = [0; REENTRANT_OPERATIONS];
+        let mut index = 0;
+        while index < bytes.len() {
+            bytes[index] = index as u8;
+            index += 1;
+        }
+        bytes
     };
+    let (read_end, write_end) = blocking_pipe()?;
+    let mut proactor = kernel_proactor(false)?;
     let id = route(1);
     let observed = Rc::new(RefCell::new(Vec::new()));
     proactor.register_subsystem(id, Recorder(Rc::clone(&observed)))?;
@@ -108,14 +101,25 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
     while observed.borrow().len() < REENTRANT_OPERATIONS + 1 {
         assert_before_deadline(started, "reentrant SQ saturation");
         proactor.wait_completions(1, Some(Duration::from_millis(20)), |completion, context| {
-            assert_eq!(completion.result, 0);
-            if completion.op_id.payload().raw() == 0 {
+            let seed = completion.op_id.payload().raw() == 0;
+            assert_eq!(completion.result, if seed { 0 } else { 1 });
+            if seed {
                 assert!(!staged, "seed CQE was dispatched twice");
                 for sequence in 1..=REENTRANT_OPERATIONS {
                     context.prepare_sqe_with(operation(id, sequence as u64), |sqe| {
-                        // SAFETY: The context supplies exclusive initialized SQE
-                        // storage; NOP retains no pointers after preparation.
-                        unsafe { sys::uring_shim_prep_nop(sqe) };
+                        // SAFETY: Exclusive SQE storage references immutable static
+                        // bytes; the pipe stays open through every final CQE.
+                        unsafe {
+                            let byte = &BYTES[sequence - 1] as *const u8;
+                            sys::uring_shim_prep_write(
+                                sqe,
+                                write_end.as_raw_fd(),
+                                byte.cast(),
+                                1,
+                                0,
+                            );
+                            (*sqe).flags |= sys::IOSQE_IO_DRAIN as u8;
+                        }
                     })?;
                 }
                 staged = true;
@@ -131,6 +135,10 @@ fn integration_scenario_reentrant_sq_saturation_preserves_all_128_operations() -
     for sequence in 0..=REENTRANT_OPERATIONS {
         assert!(unique.contains(&operation(id, sequence as u64).raw()));
     }
+    // DRAIN serializes writes in submission order, independently of CQE order.
+    let mut actual = [0; REENTRANT_OPERATIONS];
+    std::fs::File::from(read_end).read_exact(&mut actual)?;
+    assert_eq!(actual, BYTES, "staged submissions must preserve FIFO order");
     assert_eq!(
         proactor.tick()?,
         0,
@@ -144,6 +152,7 @@ fn integration_scenario_three_subsystems_reuse_56_bit_payloads_without_crosstalk
     const PER_SUBSYSTEM: usize = 32;
     const OPERATIONS: usize = PER_SUBSYSTEM * 2;
     let pipes = [blocking_pipe()?, blocking_pipe()?, blocking_pipe()?];
+    let mut proactor = kernel_proactor(false)?;
     let mut inbound = std::mem::ManuallyDrop::new([
         Box::new([0_u8; PER_SUBSYSTEM]),
         Box::new([0; PER_SUBSYSTEM]),
@@ -154,11 +163,7 @@ fn integration_scenario_three_subsystems_reuse_56_bit_payloads_without_crosstalk
         Box::new([0x72; PER_SUBSYSTEM]),
         Box::new([0xb4; PER_SUBSYSTEM]),
     ]);
-    // Error and panic paths retain DMA storage: ring destruction alone does not
-    // prove the kernel has stopped using buffers. Success frees it after drain.
-    let Some(mut proactor) = kernel_proactor(false)? else {
-        return Ok(());
-    };
+    // Failure retains DMA storage; success frees it only after final CQEs and shutdown.
     let records: Vec<_> = (0..3).map(|_| Rc::new(RefCell::new(Vec::new()))).collect();
     for (index, record) in records.iter().enumerate() {
         proactor.register_subsystem(route(index as u8 + 1), Recorder(Rc::clone(record)))?;
@@ -202,6 +207,10 @@ fn integration_scenario_three_subsystems_reuse_56_bit_payloads_without_crosstalk
             assert_eq!(completion.result, 1);
             assert!(unique.insert(completion.op_id.payload().raw()));
         }
+        let expected: HashSet<_> = (0..PER_SUBSYSTEM as u64)
+            .flat_map(|n| [0x00ff_ffff_ffff_0000 | n, 0x00ff_ffff_ffff_8000 | n])
+            .collect();
+        assert_eq!(unique, expected, "full-width read/write payloads");
         assert_eq!(*inbound[subsystem], *outbound[subsystem]);
     }
     proactor.shutdown()?;
@@ -216,9 +225,7 @@ fn integration_scenario_three_subsystems_reuse_56_bit_payloads_without_crosstalk
 
 #[test]
 fn integration_lifecycle_scenario_waker_flood_delivers_10000_unique_commands() -> TestResult {
-    let Some(mut proactor) = kernel_proactor(true)? else {
-        return Ok(());
-    };
+    let mut proactor = kernel_proactor(true)?;
     let waker = proactor.waker().expect("waker was explicitly enabled");
     let total = COMMAND_THREADS * COMMANDS_PER_THREAD;
     let commands = CrossThreadCommandQueue::new(total, waker);
@@ -278,9 +285,7 @@ fn integration_lifecycle_scenario_fixed_read_cancellation_quarantines_until_targ
 -> TestResult {
     const BUFFER_COUNT: u16 = 16;
     let (read_end, _writer_kept_open) = blocking_pipe()?;
-    let Some(mut proactor) = kernel_proactor(false)? else {
-        return Ok(());
-    };
+    let mut proactor = kernel_proactor(false)?;
     let records = Rc::new(RefCell::new(Vec::new()));
     let id = route(1);
     proactor.register_subsystem(id, Recorder(Rc::clone(&records)))?;
@@ -399,9 +404,7 @@ fn integration_lifecycle_scenario_provided_ring_exhaustion_recovers_after_lease_
     let sender = UdpSocket::bind("127.0.0.1:0")?;
     sender.connect(receiver.local_addr()?)?;
     receiver.set_nonblocking(true)?;
-    let Some(mut proactor) = kernel_proactor(false)? else {
-        return Ok(());
-    };
+    let mut proactor = kernel_proactor(false)?;
     let id = route(1);
     let receive = operation(id, 0x100);
     let cancel = operation(id, 0x200);
@@ -602,9 +605,7 @@ fn integration_lifecycle_scenario_socket_bridge_maps_native_poll_and_close_opera
 
     let (socket, _peer_kept_open) = UnixDatagram::pair()?;
     socket.set_nonblocking(true)?;
-    let Some(mut proactor) = kernel_proactor(false)? else {
-        return Ok(());
-    };
+    let mut proactor = kernel_proactor(false)?;
     let id = route(3);
     let records = Rc::new(RefCell::new(Vec::new()));
     proactor.register_subsystem(id, Recorder(Rc::clone(&records)))?;
