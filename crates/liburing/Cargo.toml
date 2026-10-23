@@ -1,0 +1,23 @@
+[package]
+name = "liburing-proactor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description = "Thread-confined io_uring proactor with subsystem dispatch and bounded staging"
+
+[lib]
+name = "liburing"
+
+[dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+liburing-macros = { workspace = true }
+static_assertions = { workspace = true }
+
+[lints]
+workspace = true
