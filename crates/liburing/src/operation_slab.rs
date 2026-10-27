@@ -13,6 +13,8 @@ use crate::{
 const SLOT_BITS: u32 = 24;
 const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 const MAX_CAPACITY: usize = 1 << SLOT_BITS;
+/// Free-list terminator. Every live index is below `1 << 24`.
+const NONE_FREE: u32 = u32::MAX;
 
 /// A slot and a nonzero generation encoded into the 56-bit operation payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,31 +84,91 @@ pub enum OperationKind {
 }
 
 /// Ownership state of an allocated operation slot.
+///
+/// Discriminants occupy the low two bits of `OperationPhase`.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationState {
     /// The kernel may still access the operation's resources.
-    InFlight,
+    InFlight = 0,
     /// Cancellation was requested; the target's final CQE is still required.
-    Canceling,
+    Canceling = 1,
     /// A zero-copy main completion requires the notification CQE.
-    AwaitingZeroCopyNotification,
+    AwaitingZeroCopyNotification = 2,
     /// The operation no longer permits kernel access and can be removed.
-    Completed,
+    Completed = 3,
+}
+
+/// Completion phase whose low two bits are the [`OperationState`] discriminant.
+///
+/// `InFlightNotifSeen` and `CancelingNotifSeen` remember a zero-copy notification
+/// that arrived before the main CQE. Those phases still report
+/// [`OperationState::InFlight`] and [`OperationState::Canceling`].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationPhase {
+    /// No main CQE and no zero-copy notification yet.
+    InFlight = 0,
+    /// Cancellation was requested. Neither zero-copy CQE has arrived.
+    Canceling = 1,
+    /// The zero-copy main CQE carried `MORE` and the notification is outstanding.
+    AwaitingZeroCopyNotif = 2,
+    /// Required CQEs have arrived and the slot may be removed.
+    Completed = 3,
+    /// A zero-copy notification arrived before the main CQE.
+    InFlightNotifSeen = 1 << 2,
+    /// Cancellation was requested after the notification and before the main CQE.
+    CancelingNotifSeen = (1 << 2) | 1,
+}
+
+const _: () = {
+    assert!((OperationPhase::InFlight as u8 & 0x03) == OperationState::InFlight as u8);
+    assert!((OperationPhase::Canceling as u8 & 0x03) == OperationState::Canceling as u8);
+    assert!(
+        (OperationPhase::AwaitingZeroCopyNotif as u8 & 0x03)
+            == OperationState::AwaitingZeroCopyNotification as u8
+    );
+    assert!((OperationPhase::Completed as u8 & 0x03) == OperationState::Completed as u8);
+    assert!((OperationPhase::InFlightNotifSeen as u8 & 0x03) == OperationState::InFlight as u8);
+    assert!((OperationPhase::CancelingNotifSeen as u8 & 0x03) == OperationState::Canceling as u8);
+    assert!(NONE_FREE as usize > MAX_CAPACITY);
+};
+
+impl OperationPhase {
+    /// Projects this phase onto the public ownership state.
+    ///
+    /// The low two bits are the [`OperationState`] discriminant.
+    ///
+    /// # Errors
+    /// Does not return errors.
+    ///
+    /// # Panics
+    /// Does not panic. Every phase discriminant maps to a state.
+    #[inline(always)]
+    pub const fn state(self) -> OperationState {
+        // SAFETY: The const asserts above lock `discriminant & 0x03` to
+        // `InFlight` (0), `Canceling` (1), `AwaitingZeroCopyNotification` (2),
+        // or `Completed` (3), which are the `#[repr(u8)]` values of `OperationState`.
+        unsafe { core::mem::transmute::<u8, OperationState>(self as u8 & 0x03) }
+    }
 }
 
 struct Operation<Meta> {
     meta: Meta,
     kind: OperationKind,
-    state: OperationState,
-    main_seen: bool,
-    notification_seen: bool,
+    phase: OperationPhase,
 }
 
+/// `generation` and `next_free` share one 8-byte word. `next_free` is [`NONE_FREE`]
+/// when the slot is occupied or retired.
+#[repr(C)]
 struct Slot<Meta> {
     generation: u32,
+    next_free: u32,
     operation: Option<Operation<Meta>>,
-    next_free: Option<usize>,
 }
+
+const _: () = assert!(core::mem::offset_of!(Slot<()>, next_free) == 4);
 
 /// Preallocated operation slots with generation checks and explicit retirement.
 ///
@@ -115,7 +177,7 @@ struct Slot<Meta> {
 /// than allowing any previous key to become valid again.
 pub struct OperationSlab<Meta = ()> {
     slots: Box<[Slot<Meta>]>,
-    free_head: Option<usize>,
+    free_head: u32,
     len: usize,
     retired: usize,
 }
@@ -138,15 +200,20 @@ impl<Meta> OperationSlab<Meta> {
             .try_reserve_exact(capacity)
             .map_err(|_| UringError::InvalidConfig("operation slab allocation failed"))?;
         for index in 0..capacity {
+            let next_free = if index + 1 < capacity {
+                (index + 1) as u32
+            } else {
+                NONE_FREE
+            };
             slots.push(Slot {
                 generation: 0,
+                next_free,
                 operation: None,
-                next_free: (index + 1 < capacity).then_some(index + 1),
             });
         }
         Ok(Self {
             slots: slots.into_boxed_slice(),
-            free_head: Some(0),
+            free_head: 0,
             len: 0,
             retired: 0,
         })
@@ -160,26 +227,27 @@ impl<Meta> OperationSlab<Meta> {
     ///
     /// # Panics
     /// A rejected metadata value's destructor may panic.
+    #[inline(always)]
     pub fn insert(&mut self, meta: Meta, kind: OperationKind) -> Result<OperationKey> {
-        let index = self.free_head.ok_or(UringError::SqRingFull)?;
-        let slot = &mut self.slots[index];
-        let generation = slot
-            .generation
-            .checked_add(1)
-            .ok_or(UringError::SqRingFull)?;
+        let index = self.free_head;
+        if index == NONE_FREE {
+            return Err(UringError::SqRingFull);
+        }
+        let slot = &mut self.slots[index as usize];
+        let Some(generation) = slot.generation.checked_add(1) else {
+            return Err(UringError::SqRingFull);
+        };
         self.free_head = slot.next_free;
-        slot.next_free = None;
+        slot.next_free = NONE_FREE;
         slot.generation = generation;
         slot.operation = Some(Operation {
             meta,
             kind,
-            state: OperationState::InFlight,
-            main_seen: false,
-            notification_seen: false,
+            phase: OperationPhase::InFlight,
         });
         self.len += 1;
         Ok(OperationKey(
-            (u64::from(generation) << SLOT_BITS) | index as u64,
+            (u64::from(generation) << SLOT_BITS) | u64::from(index),
         ))
     }
 
@@ -215,8 +283,9 @@ impl<Meta> OperationSlab<Meta> {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline(always)]
     pub fn state(&self, key: OperationKey) -> Result<OperationState> {
-        Ok(self.operation(key)?.state)
+        Ok(self.operation(key)?.phase.state())
     }
 
     /// Marks a target as canceling without changing ownership of its metadata.
@@ -229,15 +298,15 @@ impl<Meta> OperationSlab<Meta> {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline(always)]
     pub fn mark_canceling(&mut self, key: OperationKey) -> Result<()> {
         let operation = self.operation_mut(key)?;
-        match operation.state {
-            OperationState::Completed => Err(UringError::InvalidPayload(key.0)),
-            OperationState::AwaitingZeroCopyNotification | OperationState::Canceling => Ok(()),
-            OperationState::InFlight => {
-                operation.state = OperationState::Canceling;
+        match begin_cancel(operation.phase) {
+            Ok(phase) => {
+                operation.phase = phase;
                 Ok(())
             }
+            Err(()) => Err(UringError::InvalidPayload(key.0)),
         }
     }
 
@@ -255,40 +324,16 @@ impl<Meta> OperationSlab<Meta> {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline(always)]
     pub fn complete(&mut self, key: OperationKey, _result: i32, flags: u32) -> Result<bool> {
         let operation = self.operation_mut(key)?;
-        if operation.state == OperationState::Completed {
-            return Err(UringError::InvalidPayload(key.0));
+        match apply_cqe(operation.kind, operation.phase, flags) {
+            Ok(next) => {
+                operation.phase = next;
+                Ok(next == OperationPhase::Completed)
+            }
+            Err(()) => Err(UringError::InvalidPayload(key.0)),
         }
-        let more = io_uring::cqueue::more(flags);
-        let notification = io_uring::cqueue::notif(flags);
-        if operation.kind != OperationKind::ZeroCopy {
-            if notification {
-                return Err(UringError::InvalidPayload(key.0));
-            }
-            if !more {
-                operation.state = OperationState::Completed;
-            }
-        } else if notification {
-            if more || operation.notification_seen {
-                return Err(UringError::InvalidPayload(key.0));
-            }
-            operation.notification_seen = true;
-            if operation.main_seen {
-                operation.state = OperationState::Completed;
-            }
-        } else {
-            if operation.main_seen {
-                return Err(UringError::InvalidPayload(key.0));
-            }
-            operation.main_seen = true;
-            if !more || operation.notification_seen {
-                operation.state = OperationState::Completed;
-            } else {
-                operation.state = OperationState::AwaitingZeroCopyNotification;
-            }
-        }
-        Ok(operation.state == OperationState::Completed)
     }
 
     /// Removes metadata only after the operation has reached final completion.
@@ -298,8 +343,9 @@ impl<Meta> OperationSlab<Meta> {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline(always)]
     pub fn remove(&mut self, key: OperationKey) -> Result<Meta> {
-        if self.operation(key)?.state != OperationState::Completed {
+        if self.operation(key)?.phase != OperationPhase::Completed {
             return Err(UringError::InvalidPayload(key.0));
         }
         self.take(key)
@@ -337,17 +383,17 @@ impl<Meta> OperationSlab<Meta> {
     /// # Panics
     /// A metadata value's destructor may panic.
     pub unsafe fn retire_after_ring_close(&mut self) {
-        self.free_head = None;
+        self.free_head = NONE_FREE;
         self.len = 0;
         self.retired = 0;
         for index in (0..self.slots.len()).rev() {
             let slot = &mut self.slots[index];
             if slot.generation < u32::MAX {
                 slot.next_free = self.free_head;
-                self.free_head = Some(index);
+                self.free_head = index as u32;
             } else {
                 self.retired += 1;
-                slot.next_free = None;
+                slot.next_free = NONE_FREE;
             }
             drop(slot.operation.take());
         }
@@ -411,44 +457,139 @@ impl<Meta> OperationSlab<Meta> {
         self.slots.len() - self.len - self.retired
     }
 
+    #[inline(always)]
     fn operation(&self, key: OperationKey) -> Result<&Operation<Meta>> {
-        let slot = self
-            .slots
-            .get(key.slot())
-            .filter(|slot| slot.generation == key.generation())
-            .ok_or(UringError::InvalidPayload(key.0))?;
-        slot.operation
-            .as_ref()
-            .ok_or(UringError::InvalidPayload(key.0))
+        let Some(slot) = self.slots.get(key.slot()) else {
+            return Err(UringError::InvalidPayload(key.0));
+        };
+        if slot.generation != key.generation() {
+            return Err(UringError::InvalidPayload(key.0));
+        }
+        let Some(operation) = slot.operation.as_ref() else {
+            return Err(UringError::InvalidPayload(key.0));
+        };
+        Ok(operation)
     }
 
+    #[inline(always)]
     fn operation_mut(&mut self, key: OperationKey) -> Result<&mut Operation<Meta>> {
-        let slot = self
-            .slots
-            .get_mut(key.slot())
-            .filter(|slot| slot.generation == key.generation())
-            .ok_or(UringError::InvalidPayload(key.0))?;
-        slot.operation
-            .as_mut()
-            .ok_or(UringError::InvalidPayload(key.0))
+        let Some(slot) = self.slots.get_mut(key.slot()) else {
+            return Err(UringError::InvalidPayload(key.0));
+        };
+        if slot.generation != key.generation() {
+            return Err(UringError::InvalidPayload(key.0));
+        }
+        let Some(operation) = slot.operation.as_mut() else {
+            return Err(UringError::InvalidPayload(key.0));
+        };
+        Ok(operation)
     }
 
+    #[inline(always)]
     fn take(&mut self, key: OperationKey) -> Result<Meta> {
         self.operation(key)?;
-        let slot = &mut self.slots[key.slot()];
-        let operation = slot
-            .operation
-            .take()
-            .ok_or(UringError::InvalidPayload(key.0))?;
+        let index = key.slot();
+        let slot = &mut self.slots[index];
+        let Some(operation) = slot.operation.take() else {
+            return Err(UringError::InvalidPayload(key.0));
+        };
         if slot.generation < u32::MAX {
             slot.next_free = self.free_head;
-            self.free_head = Some(key.slot());
+            self.free_head = index as u32;
         } else {
+            slot.next_free = NONE_FREE;
             self.retired += 1;
         }
         self.len -= 1;
         Ok(operation.meta)
     }
+}
+
+#[inline(always)]
+fn begin_cancel(phase: OperationPhase) -> core::result::Result<OperationPhase, ()> {
+    let raw = phase as u8;
+    // Cancellation from `InFlight` is the common transition. The other phases
+    // stay on the cold side of this branch so the straight line only stores
+    // `Canceling`.
+    if raw != OperationPhase::InFlight as u8 {
+        core::hint::cold_path();
+        if raw == OperationPhase::InFlightNotifSeen as u8 {
+            return Ok(OperationPhase::CancelingNotifSeen);
+        }
+        if raw == OperationPhase::Completed as u8 {
+            return Err(());
+        }
+        return Ok(phase);
+    }
+    Ok(OperationPhase::Canceling)
+}
+
+#[inline(always)]
+fn apply_cqe(
+    kind: OperationKind,
+    phase: OperationPhase,
+    flags: u32,
+) -> core::result::Result<OperationPhase, ()> {
+    let raw = phase as u8;
+    if raw == OperationPhase::Completed as u8 {
+        return Err(());
+    }
+    let more = io_uring::cqueue::more(flags);
+    let notification = io_uring::cqueue::notif(flags);
+    if kind as u8 != OperationKind::ZeroCopy as u8 {
+        if notification {
+            return Err(());
+        }
+        return Ok(if more {
+            phase
+        } else {
+            OperationPhase::Completed
+        });
+    }
+    if notification {
+        zero_copy_notification(raw, more)
+    } else {
+        zero_copy_main(raw, more)
+    }
+}
+
+/// Zero-copy main CQE. `MORE` on `InFlight` or `Canceling` waits for the notification
+/// and drops a pending cancel; a notification already observed completes the slot.
+#[inline(always)]
+fn zero_copy_main(raw: u8, more: bool) -> core::result::Result<OperationPhase, ()> {
+    if raw == OperationPhase::InFlight as u8 || raw == OperationPhase::Canceling as u8 {
+        return Ok(if more {
+            OperationPhase::AwaitingZeroCopyNotif
+        } else {
+            OperationPhase::Completed
+        });
+    }
+    if raw == OperationPhase::AwaitingZeroCopyNotif as u8 {
+        return Err(());
+    }
+    Ok(OperationPhase::Completed)
+}
+
+/// Zero-copy notification CQE. The steady state is `AwaitingZeroCopyNotif` with `MORE` clear.
+#[inline(always)]
+fn zero_copy_notification(raw: u8, more: bool) -> core::result::Result<OperationPhase, ()> {
+    if raw == OperationPhase::AwaitingZeroCopyNotif as u8 {
+        if more {
+            return Err(());
+        }
+        return Ok(OperationPhase::Completed);
+    }
+    if more
+        || raw == OperationPhase::InFlightNotifSeen as u8
+        || raw == OperationPhase::CancelingNotifSeen as u8
+    {
+        return Err(());
+    }
+    Ok(if raw == OperationPhase::Canceling as u8 {
+        OperationPhase::CancelingNotifSeen
+    } else {
+        OperationPhase::InFlightNotifSeen
+    })
 }
 
 impl<Meta> Drop for OperationSlab<Meta> {
@@ -457,7 +598,7 @@ impl<Meta> Drop for OperationSlab<Meta> {
             if slot
                 .operation
                 .as_ref()
-                .is_some_and(|operation| operation.state != OperationState::Completed)
+                .is_some_and(|operation| operation.phase != OperationPhase::Completed)
                 && let Some(operation) = slot.operation.take()
             {
                 core::mem::forget(operation.meta);

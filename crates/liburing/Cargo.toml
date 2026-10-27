@@ -18,6 +18,11 @@ thiserror = { workspace = true }
 [dev-dependencies]
 liburing-macros = { workspace = true }
 static_assertions = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "uring_hotpath_bench"
+harness = false
 
 [lints]
 workspace = true

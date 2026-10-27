@@ -14,13 +14,14 @@ use crate::{
     id::BufferId,
 };
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    Free,
-    Retired,
-    CheckedOut,
-    InFlight,
-    Quarantined,
+    Free = 0,
+    Retired = 1,
+    CheckedOut = 2,
+    InFlight = 4,
+    Quarantined = 5,
 }
 
 struct Slot {
