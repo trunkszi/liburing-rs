@@ -109,11 +109,24 @@ struct SocketOperation {
     socket: SocketId,
     kind: SocketOperationKind,
 }
+
+/// Socket slot phase: accepting work, draining issued work, or retired.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketSlotPhase {
+    /// Submissions are accepted.
+    Active = 0,
+    /// Close was requested while operations remain in flight.
+    DrainingInFlight = 1,
+    /// The descriptor is retired.
+    Closed = 2,
+}
+
 struct SocketRecord {
     fd: Rc<OwnedFd>,
     active: usize,
     receive: Option<OperationId>,
-    closing: bool,
+    phase: SocketSlotPhase,
 }
 struct SocketSlot {
     generation: u32,
@@ -191,7 +204,7 @@ impl CompletionSocketIo {
             fd: Rc::new(fd),
             active: 0,
             receive: None,
-            closing: false,
+            phase: SocketSlotPhase::Active,
         });
         Ok(SocketId {
             slot: index as u32,
@@ -225,7 +238,7 @@ impl CompletionSocketIo {
         mode: ReceiveMode,
     ) -> Result<OperationId> {
         let record = self.record(socket)?;
-        if record.closing || record.receive.is_some() {
+        if record.phase != SocketSlotPhase::Active || record.receive.is_some() {
             return Err(UringError::InvalidConfig(
                 "socket is closing or already receiving",
             ));
@@ -300,7 +313,7 @@ impl CompletionSocketIo {
         zero_copy: bool,
     ) -> Result<OperationId> {
         let record = self.record(socket)?;
-        if record.closing {
+        if record.phase != SocketSlotPhase::Active {
             return Err(UringError::InvalidConfig("socket is closing"));
         }
         let fd = Rc::clone(&record.fd);
@@ -392,8 +405,11 @@ impl CompletionSocketIo {
             if matches!(kind, SocketOperationKind::Receive) {
                 record.receive = None;
             }
+            if record.phase == SocketSlotPhase::DrainingInFlight && record.active == 0 {
+                record.phase = SocketSlotPhase::Closed;
+            }
         }
-        let closed = terminal && self.record(socket)?.closing && self.record(socket)?.active == 0;
+        let closed = self.record(socket)?.phase == SocketSlotPhase::Closed;
         if closed {
             self.retire_socket(socket)?;
         }
@@ -510,7 +526,19 @@ impl CompletionSocketIo {
         socket: SocketId,
         mut cancel: impl FnMut(OperationId) -> Result<bool>,
     ) -> Result<()> {
-        self.record_mut(socket)?.closing = true;
+        {
+            let record = self.record_mut(socket)?;
+            record.phase = match record.phase {
+                SocketSlotPhase::Closed => SocketSlotPhase::Closed,
+                SocketSlotPhase::Active | SocketSlotPhase::DrainingInFlight => {
+                    if record.active == 0 {
+                        SocketSlotPhase::Closed
+                    } else {
+                        SocketSlotPhase::DrainingInFlight
+                    }
+                }
+            };
+        }
         self.close_scratch.clear();
         for (key, operation) in self.operations.iter() {
             if operation.socket == socket {
@@ -528,7 +556,7 @@ impl CompletionSocketIo {
             }
             self.operations.mark_canceling(target_key)?;
         }
-        if self.record(socket)?.active == 0 {
+        if self.record(socket)?.phase == SocketSlotPhase::Closed {
             self.retire_socket(socket)?;
         }
         Ok(())

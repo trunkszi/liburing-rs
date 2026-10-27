@@ -5,6 +5,7 @@ use crate::{OperationId, Result, UringError, operation_slab::OperationKey};
 /// A preallocated linear-probe table at most half occupied.
 pub(crate) struct IdentityMap {
     entries: Box<[Option<(OperationId, OperationKey)>]>,
+    mask: usize,
     capacity: usize,
     len: usize,
 }
@@ -30,6 +31,7 @@ impl IdentityMap {
         entries.resize(slots, None);
         Ok(Self {
             entries: entries.into_boxed_slice(),
+            mask: slots - 1,
             capacity,
             len: 0,
         })
@@ -42,9 +44,10 @@ impl IdentityMap {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline(always)]
     pub(crate) fn get(&self, id: &OperationId) -> Option<&OperationKey> {
-        self.find(*id)
-            .and_then(|index| self.entries[index].as_ref().map(|(_, key)| key))
+        let index = self.find(*id)?;
+        self.entries[index].as_ref().map(|(_, key)| key)
     }
 
     /// Reports whether this exact caller identity is currently occupied.
@@ -66,16 +69,20 @@ impl IdentityMap {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline]
     pub(crate) fn insert(&mut self, id: OperationId, key: OperationKey) -> Result<()> {
-        if self.contains_key(&id) {
-            return Err(UringError::InvalidPayload(id.raw()));
+        let mut index = self.bucket(id);
+        loop {
+            match self.entries[index] {
+                Some((identity, _)) if identity == id => {
+                    return Err(UringError::InvalidPayload(id.raw()));
+                }
+                Some(_) => index = self.next(index),
+                None => break,
+            }
         }
         if self.len == self.capacity {
             return Err(UringError::SqRingFull);
-        }
-        let mut index = self.bucket(id);
-        while self.entries[index].is_some() {
-            index = self.next(index);
         }
         self.entries[index] = Some((id, key));
         self.len += 1;
@@ -89,11 +96,12 @@ impl IdentityMap {
     ///
     /// # Panics
     /// Does not panic.
+    #[inline]
     pub(crate) fn remove(&mut self, id: &OperationId) -> Option<OperationKey> {
         let mut hole = self.find(*id)?;
         let (_, removed) = self.entries[hole].take()?;
         self.len -= 1;
-        let mask = self.entries.len() - 1;
+        let mask = self.mask;
         let mut cursor = self.next(hole);
         while let Some((identity, _)) = self.entries[cursor] {
             let home = self.bucket(identity);
@@ -120,28 +128,34 @@ impl IdentityMap {
         self.len
     }
 
+    #[inline(always)]
     fn find(&self, id: OperationId) -> Option<usize> {
+        let entries = self.entries.as_ref();
+        let mask = self.mask;
+        let raw = id.raw();
         let mut index = self.bucket(id);
         loop {
-            match self.entries[index] {
-                Some((identity, _)) if identity == id => return Some(index),
-                Some(_) => index = self.next(index),
+            match entries[index] {
+                Some((identity, _)) if identity.raw() == raw => return Some(index),
+                Some(_) => index = (index + 1) & mask,
                 None => return None,
             }
         }
     }
 
+    #[inline(always)]
     fn next(&self, index: usize) -> usize {
-        (index + 1) & (self.entries.len() - 1)
+        (index + 1) & self.mask
     }
 
+    #[inline(always)]
     fn bucket(&self, id: OperationId) -> usize {
         // SplitMix64's finalizer spreads both routing and payload bits before
         // masking into a fixed power-of-two table. No random state is required.
         let mut value = id.raw();
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((value ^ (value >> 31)) as usize) & (self.entries.len() - 1)
+        ((value ^ (value >> 31)) as usize) & self.mask
     }
 }
 
