@@ -4,7 +4,7 @@ default-members = ["crates/liburing"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/trunkszi/liburing-rs"
@@ -12,7 +12,7 @@ repository = "https://github.com/trunkszi/liburing-rs"
 [workspace.dependencies]
 liburing = { path = "crates/liburing", package = "liburing-proactor" }
 io-uring = { version = "0.7.15" }
-liburing-macros = { path = "crates/liburing-macros" }
+liburing-macros = { version = "0.0.2", path = "crates/liburing-macros" }
 libc = { version = "0.2" }
 thiserror = { version = "2" }
 syn = { version = "2", features = ["full", "extra-traits"] }
