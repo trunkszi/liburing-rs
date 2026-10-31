@@ -2,7 +2,9 @@
 
 use super::Proactor;
 use crate::{
-    BufferGroupId, Result, UringError, buffer_ring::BufferRing, fixed_buffers::FixedBufferPool,
+    BufferGroupId, Result, UringError,
+    buffer_ring::BufferRing,
+    fixed_buffers::{DEFAULT_ALIGNMENT, FixedBufferPool},
     fixed_files::FixedFileTable,
 };
 
@@ -55,6 +57,25 @@ impl Proactor {
     /// # Panics
     /// Does not intentionally panic.
     pub fn configure_fixed_buffers(&mut self, count: u16, length: usize) -> Result<()> {
+        self.configure_direct_buffers(count, length, DEFAULT_ALIGNMENT)
+    }
+
+    /// Allocates the ring's fixed-buffer table at a caller-chosen alignment.
+    ///
+    /// `alignment` must be a power of two. Pass the file's `statx`
+    /// `stx_dio_mem_align` for `O_DIRECT`.
+    ///
+    /// # Errors
+    /// Returns configuration, allocation, or kernel registration errors.
+    ///
+    /// # Panics
+    /// Does not intentionally panic.
+    pub fn configure_direct_buffers(
+        &mut self,
+        count: u16,
+        buffer_len: usize,
+        alignment: usize,
+    ) -> Result<()> {
         self.ensure_open()?;
         if self
             .resources
@@ -65,9 +86,16 @@ impl Proactor {
                 "fixed buffers are already configured",
             ));
         }
+        if !alignment.is_power_of_two() {
+            return Err(UringError::InvalidConfig(
+                "buffer alignment must be a power of two",
+            ));
+        }
         // SAFETY: The boxed ring remains stable and owned until all tracked DMA
         // retires; resource tables are dropped before this ring is destroyed.
-        let pool = unsafe { FixedBufferPool::new(self.ring_mut(), count, length) }?;
+        let pool = unsafe {
+            FixedBufferPool::with_alignment(self.ring_mut(), count, buffer_len, alignment)
+        }?;
         self.resources
             .as_mut()
             .ok_or(UringError::InvalidConfig("resources are closed"))?

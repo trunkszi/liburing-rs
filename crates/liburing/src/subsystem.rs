@@ -6,6 +6,7 @@ use crate::{
     BufferGroupId, OperationId, Result, SubsystemId, UringError,
     backend::RawSqe,
     buffer_ring::BufferRing,
+    config::OpcodeSet,
     fixed_buffers::{FixedBufferPool, InFlightWaitingBuffer},
     operation::{self, PendingBuffer, StagedSqe, TrackedOperation},
     operation_slab::{OperationKey, OperationSlab},
@@ -67,6 +68,9 @@ where
 pub struct SubmissionContext<'a> {
     pub(crate) staged: &'a mut VecDeque<StagedSqe>,
     pub(crate) capacity: usize,
+    pub(crate) admission: OpcodeSet,
+    pub(crate) cancellable: bool,
+    pub(crate) mode_name: &'static str,
     pub(crate) operations: &'a mut OperationSlab<TrackedOperation>,
     pub(crate) identities: &'a mut crate::identity_map::IdentityMap,
     pub(crate) resources: &'a Resources,
@@ -93,7 +97,7 @@ impl SubmissionContext<'_> {
 
     /// Stages cancellation without consuming an application operation slot.
     /// # Errors
-    /// Returns staging-capacity or operation-state errors.
+    /// Returns mode, staging-capacity, or operation-state errors.
     /// # Panics
     /// Does not panic.
     pub fn cancel(&mut self, target: OperationId) -> Result<bool> {
@@ -105,13 +109,18 @@ impl SubmissionContext<'_> {
 
     /// Stages cancellation for exactly one current ring generation.
     /// # Errors
-    /// Returns staging-capacity or operation-state errors.
+    /// Returns mode, staging-capacity, or operation-state errors.
     /// # Panics
     /// Does not panic.
     pub fn cancel_key(&mut self, key: OperationKey) -> Result<bool> {
         let Ok(operation) = self.operations.get(key) else {
             return Ok(false);
         };
+        if !self.cancellable {
+            return Err(UringError::CancellationUnavailable {
+                mode: self.mode_name,
+            });
+        }
         let original = operation.original;
         if self.operations.state(key)? != crate::operation_slab::OperationState::InFlight {
             return Ok(true);
@@ -252,6 +261,8 @@ impl SubmissionContext<'_> {
         operation::stage(
             self.staged,
             self.capacity,
+            self.admission,
+            self.mode_name,
             self.operations,
             self.identities,
             operation::OperationIdentity::Keyed(subsystem),
@@ -278,6 +289,8 @@ impl SubmissionContext<'_> {
         operation::stage(
             self.staged,
             self.capacity,
+            self.admission,
+            self.mode_name,
             self.operations,
             self.identities,
             operation::OperationIdentity::Caller(id),

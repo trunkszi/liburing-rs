@@ -2,9 +2,15 @@
 //!
 //! Pointer operands must outlive final CQEs, including after cancellation.
 
+pub mod fs;
 pub mod net;
+
 use std::time::Duration;
 
+pub use fs::{
+    prep_read, prep_read_fixed, prep_readv, prep_readv_fixed, prep_write, prep_write_fixed,
+    prep_writev, prep_writev_fixed,
+};
 use io_uring::{opcode, types::Timespec};
 
 use crate::{
@@ -104,4 +110,22 @@ pub unsafe fn prep_nop(sqe: *mut RawSqe) {
         (*sqe).flags |= flags;
         (*sqe).personality = personality;
     };
+}
+
+/// Copies one built entry into caller-owned SQE storage.
+///
+/// # Safety
+/// `sqe` must point to initialized, exclusively writable SQE storage. The copied
+/// entry must not be the last owner of any descriptor or buffer.
+pub(super) unsafe fn write_entry(sqe: *mut RawSqe, entry: io_uring::squeue::Entry) {
+    // SAFETY: The caller supplies initialized, exclusively writable SQE storage.
+    // Copying the 64-byte entry transfers no pointer or descriptor ownership.
+    // Preserved identity, flags, and personality stay with the caller's SQE.
+    unsafe {
+        let (identity, flags, personality) = ((*sqe).user_data, (*sqe).flags, (*sqe).personality);
+        *sqe = RawSqe::from_entry(entry);
+        (*sqe).user_data = identity;
+        (*sqe).flags |= flags;
+        (*sqe).personality = personality;
+    }
 }

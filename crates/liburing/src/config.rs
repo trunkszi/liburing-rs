@@ -1,5 +1,11 @@
 //! Ring construction and bounded queue configuration.
 
+use std::time::Duration;
+
+pub(crate) mod mode;
+pub use mode::{EventDrivenConfig, ProactorMode, SqPollConfig};
+
+pub(crate) use self::mode::OpcodeSet;
 use crate::{
     error::{Result, UringError},
     proactor::Proactor,
@@ -12,7 +18,11 @@ pub struct ProactorConfig {
     pub entries: u32,
     /// Optional completion queue size, at least as large as `entries`.
     pub cq_entries: Option<u32>,
-    /// Additional Linux `IORING_SETUP_*` flags requested by the caller.
+    /// Ring polling and wait policy, fixed at construction.
+    pub mode: ProactorMode,
+    /// No-progress teardown bound; None selects the mode default.
+    pub shutdown_stall_timeout: Option<Duration>,
+    /// Mandatory modifiers: CLAMP, SUBMIT_ALL, and NO_SQARRAY only.
     pub setup_flags: u32,
     /// Probe single-issuer and task-run optimizations with older-kernel fallback.
     pub enable_optimizations: bool,
@@ -31,6 +41,8 @@ impl Default for ProactorConfig {
         Self {
             entries: 256,
             cq_entries: None,
+            mode: ProactorMode::default(),
+            shutdown_stall_timeout: None,
             setup_flags: 0,
             enable_optimizations: true,
             staged_capacity: 1024,
@@ -51,6 +63,19 @@ impl ProactorConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        let modifiers = crate::backend::IORING_SETUP_CLAMP
+            | crate::backend::IORING_SETUP_SUBMIT_ALL
+            | crate::backend::IORING_SETUP_NO_SQARRAY;
+        if self.setup_flags & !modifiers != 0 {
+            return Err(UringError::InvalidConfig(
+                "setup_flags contains mode-managed or unsupported flags",
+            ));
+        }
+        if self.mode.is_busy_poll() && !self.enable_optimizations {
+            return Err(UringError::InvalidConfig(
+                "polling modes require optimizations",
+            ));
+        }
         if self.operation_capacity == 0 || self.buffer_groups == 0 {
             return Err(UringError::InvalidConfig(
                 "operation and buffer-group capacities must be nonzero",
@@ -90,6 +115,62 @@ impl ProactorBuilder {
     /// Does not panic.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects the ring polling and wait policy.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn mode(mut self, mode: ProactorMode) -> Self {
+        self.config.mode = mode;
+        self
+    }
+
+    /// Selects low-CPU kernel waits.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn event_driven(self, config: EventDrivenConfig) -> Self {
+        self.mode(ProactorMode::EventDriven(config))
+    }
+
+    /// Selects a pinned kernel SQ thread.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn sq_poll(self, config: SqPollConfig) -> Self {
+        self.mode(ProactorMode::SqPoll(config))
+    }
+
+    /// Selects owner-driven polled direct I/O.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn io_poll(self) -> Self {
+        self.mode(ProactorMode::IoPoll)
+    }
+
+    /// Selects a pinned submission and device polling thread.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn sq_poll_io_poll(self, config: SqPollConfig) -> Self {
+        self.mode(ProactorMode::SqPollIoPoll(config))
+    }
+
+    /// Sets the maximum no-progress teardown interval.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn shutdown_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.config.shutdown_stall_timeout = Some(timeout);
+        self
     }
 
     /// Requests the kernel submission queue size.
@@ -174,6 +255,42 @@ pub struct KernelFeatures {
 }
 
 impl KernelFeatures {
+    /// Reports support for a kernel submission polling thread.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn sq_poll(&self) -> bool {
+        self.setup_flags & crate::backend::IORING_SETUP_SQPOLL != 0
+    }
+
+    /// Reports support for polled direct I/O.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn io_poll(&self) -> bool {
+        self.setup_flags & crate::backend::IORING_SETUP_IOPOLL != 0
+    }
+
+    /// Reports support for the NO_IOWAIT enter flag.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn no_iowait(&self) -> bool {
+        self.features & crate::backend::IORING_FEAT_NO_IOWAIT != 0
+    }
+
+    /// Reports support for minimum wait coalescing.
+    /// # Errors
+    /// Does not return errors.
+    /// # Panics
+    /// Does not panic.
+    pub const fn min_timeout(&self) -> bool {
+        self.features & crate::backend::IORING_FEAT_MIN_TIMEOUT != 0
+    }
+
     /// Reports whether the ring accepted `IORING_SETUP_SINGLE_ISSUER`.
     ///
     /// # Panics
@@ -204,7 +321,7 @@ mod unit {
     use super::{ProactorBuilder, UringError};
 
     #[test]
-    fn invalid_queue_shapes_are_rejected_before_ring_setup() {
+    fn invalid_queue_shapes_fail_before_setup() {
         for builder in [
             ProactorBuilder::new().entries(0),
             ProactorBuilder::new().entries(32).cq_entries(16),

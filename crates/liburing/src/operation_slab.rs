@@ -681,6 +681,9 @@ mod tests {
         let mut context = SubmissionContext {
             staged: &mut staged,
             capacity: 2,
+            admission: crate::config::OpcodeSet::ALL,
+            cancellable: true,
+            mode_name: "event-driven",
             operations: &mut operations,
             identities: &mut identities,
             resources: &resources,

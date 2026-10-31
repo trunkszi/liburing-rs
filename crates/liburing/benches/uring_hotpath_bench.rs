@@ -4,7 +4,11 @@ use std::{
     alloc::{GlobalAlloc, Layout, System},
     fs::File,
     hint::black_box,
-    os::{fd::AsRawFd, unix::net::UnixStream},
+    net::{TcpListener, TcpStream},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixStream,
+    },
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
@@ -12,13 +16,13 @@ use std::{
 use criterion::{Criterion, criterion_group};
 use io_uring::IoUring;
 use liburing::{
-    Completion, OperationId, OperationPayload, Proactor, ProactorConfig, SubmissionContext,
-    SubsystemId,
+    Completion, OperationId, OperationPayload, Proactor, ProactorBuilder, ProactorConfig,
+    ProactorMode, SubmissionContext, SubsystemId,
     backend::{IORING_CQE_F_MORE, IORING_CQE_F_NOTIF},
     fixed_buffers::FixedBufferPool,
     fixed_files::FixedFileTable,
     operation_slab::{OperationKind, OperationSlab, OperationState},
-    socket_io::{CompletionSocketIo, ReceiveMode, SocketIoConfig},
+    socket_io::{CompletionSocketIo, ReceiveMode, SocketEvent, SocketId, SocketIoConfig},
 };
 
 struct CountingAllocator {
@@ -341,6 +345,357 @@ fn bench_socket(c: &mut Criterion) {
     must(proactor.shutdown());
 }
 
+fn mode_proactor(mode: ProactorMode) -> Proactor {
+    must(
+        ProactorBuilder::new()
+            .entries(128)
+            .cq_entries(1024)
+            .mode(mode)
+            .build(),
+    )
+}
+
+fn idle_ticks(proactor: &mut Proactor, label: &str) {
+    let before_enter = proactor.stats().enter_calls;
+    assert_zero_alloc(label, || {
+        for _ in 0..1000 {
+            black_box(must(proactor.tick(&mut ignore_completion)));
+        }
+    });
+    assert_eq!(
+        proactor.stats().enter_calls,
+        before_enter,
+        "{label} entered the kernel"
+    );
+}
+
+fn nop_once(proactor: &mut Proactor, spin_wait: bool, payload: u64) {
+    let id = OperationId::pack(
+        SubsystemId::new_unchecked(1),
+        OperationPayload::new_unchecked(payload),
+    );
+    must(proactor.alloc_sqe(id));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut seen = false;
+        let mut dispatch = |completion: Completion, _context: &mut SubmissionContext<'_>| {
+            seen = completion.result == 0;
+            Ok(())
+        };
+        if spin_wait {
+            must(proactor.tick(&mut dispatch));
+        } else {
+            must(proactor.wait_completions(1, Some(Duration::from_millis(20)), &mut dispatch));
+        }
+        if seen {
+            return;
+        }
+        assert!(Instant::now() < deadline, "nop round trip timed out");
+        if spin_wait {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+fn percentile(samples: &[u128], quantile: f64) -> u128 {
+    let index = ((samples.len() - 1) as f64 * quantile).round() as usize;
+    samples[index]
+}
+
+fn print_percentiles(label: &str, samples: &mut [u128]) {
+    samples.sort_unstable();
+    println!(
+        "{label} ns p50={} p90={} p99={} p99.9={}",
+        percentile(samples, 0.50),
+        percentile(samples, 0.90),
+        percentile(samples, 0.99),
+        percentile(samples, 0.999)
+    );
+}
+
+fn time_nops(proactor: &mut Proactor, spin_wait: bool, samples: &mut [u128]) {
+    for (index, sample) in samples.iter_mut().enumerate() {
+        let started = Instant::now();
+        nop_once(proactor, spin_wait, index as u64 + 1);
+        *sample = started.elapsed().as_nanos();
+    }
+}
+
+struct PingSeen {
+    ping: bool,
+    pong: bool,
+}
+
+fn drive_socket(
+    proactor: &mut Proactor,
+    io: &mut CompletionSocketIo,
+    spin: bool,
+    seen: &mut PingSeen,
+    until_pong: bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let done = if until_pong { seen.pong } else { seen.ping };
+        if done {
+            return;
+        }
+        assert!(Instant::now() < deadline, "tcp ping timed out");
+        let mut dispatch = |completion, context: &mut SubmissionContext<'_>| {
+            io.on_completion(completion, context, |event| {
+                if let SocketEvent::Received { data, .. } = event {
+                    if &*data == b"ping" {
+                        seen.ping = true;
+                    } else if &*data == b"pong" {
+                        seen.pong = true;
+                    }
+                }
+                Ok(())
+            })
+        };
+        if spin {
+            must(proactor.tick(&mut dispatch));
+            core::hint::spin_loop();
+        } else {
+            must(proactor.wait_completions(1, Some(Duration::from_millis(20)), &mut dispatch));
+        }
+    }
+}
+
+fn tcp_pair() -> (OwnedFd, OwnedFd) {
+    let listener = must(TcpListener::bind("127.0.0.1:0"));
+    let client = must(TcpStream::connect(must(listener.local_addr())));
+    let (server, _) = must(listener.accept());
+    must(client.set_nodelay(true));
+    must(server.set_nodelay(true));
+    (client.into(), server.into())
+}
+
+fn ping_pong(
+    proactor: &mut Proactor,
+    io: &mut CompletionSocketIo,
+    client: SocketId,
+    server: SocketId,
+    spin: bool,
+) {
+    let mut seen = PingSeen {
+        ping: false,
+        pong: false,
+    };
+    must(io.receive(proactor, server, ReceiveMode::Once));
+    must(io.receive(proactor, client, ReceiveMode::Once));
+    must(io.send(proactor, client, b"ping", false));
+    drive_socket(proactor, io, spin, &mut seen, false);
+    assert!(seen.ping, "server missed ping");
+    must(io.send(proactor, server, b"pong", false));
+    drive_socket(proactor, io, spin, &mut seen, true);
+}
+
+fn socket_engine(proactor: &mut Proactor) -> CompletionSocketIo {
+    must(CompletionSocketIo::new(
+        proactor,
+        SocketIoConfig {
+            sockets: 4,
+            operations: 32,
+            receive_buffers: 8,
+            send_buffers: 4,
+            buffer_len: 64,
+            ..SocketIoConfig::default()
+        },
+    ))
+}
+
+fn ignore_completion(
+    _completion: Completion,
+    _context: &mut SubmissionContext<'_>,
+) -> liburing::Result<()> {
+    Ok(())
+}
+
+struct Affinity {
+    original: Vec<usize>,
+}
+
+impl Affinity {
+    fn pin_pair() -> liburing::Result<(Self, u32, u32)> {
+        let mut mask = vec![0usize; 16];
+        loop {
+            // SAFETY: The aligned initialized mask covers the writable byte extent.
+            // pid zero queries this owner thread and no pointer escapes the call.
+            if unsafe {
+                libc::sched_getaffinity(
+                    0,
+                    std::mem::size_of_val(mask.as_slice()),
+                    mask.as_mut_ptr().cast(),
+                )
+            } == 0
+            {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINVAL) || mask.len() >= 1 << 14 {
+                return Err(error.into());
+            }
+            mask.resize(mask.len() * 2, 0);
+        }
+        let mut cpus = mask.iter().enumerate().flat_map(|(index, word)| {
+            (0..usize::BITS).filter_map(move |bit| {
+                (word & (1usize << bit) != 0)
+                    .then_some((index * usize::BITS as usize + bit as usize) as u32)
+            })
+        });
+        let (Some(owner), Some(sq_cpu)) = (cpus.next(), cpus.next()) else {
+            return Err(liburing::UringError::InvalidConfig(
+                "SQPOLL examples and benchmarks require two allowed CPUs",
+            ));
+        };
+        let mut pinned = vec![0usize; mask.len()];
+        pinned[owner as usize / usize::BITS as usize] = 1usize << (owner % usize::BITS);
+        let guard = Self { original: mask };
+        // SAFETY: The word-aligned readable mask spans the supplied byte extent.
+        // The selected owner CPU belongs to the captured mask of this thread.
+        if unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of_val(pinned.as_slice()),
+                pinned.as_ptr().cast(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok((guard, owner, sq_cpu))
+    }
+}
+
+impl Drop for Affinity {
+    fn drop(&mut self) {
+        // SAFETY: The captured initialized mask remains readable for its full
+        // extent and restores only this calling thread's original affinity.
+        let restored = unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of_val(self.original.as_slice()),
+                self.original.as_ptr().cast(),
+            )
+        };
+        assert_eq!(
+            restored,
+            0,
+            "affinity restoration failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+fn preflight_modes() {
+    let (_affinity, _, sq_cpu) = must(Affinity::pin_pair());
+    let mut event = mode_proactor(ProactorMode::event_driven());
+    idle_ticks(&mut event, "event-driven idle tick");
+    let mut event_samples = [0_u128; 256];
+    time_nops(&mut event, true, &mut event_samples);
+    print_percentiles("event-driven nop rtt", &mut event_samples);
+    must(event.shutdown());
+
+    let mut sq = mode_proactor(ProactorMode::sq_poll(sq_cpu));
+    idle_ticks(&mut sq, "sq-poll idle tick");
+    for payload in 1..=16 {
+        nop_once(&mut sq, true, payload);
+    }
+    let baseline_enters = sq.stats().enter_calls;
+    assert_zero_alloc("sq-poll warm nop", || nop_once(&mut sq, true, 17));
+    let mut sq_samples = [0_u128; 256];
+    time_nops(&mut sq, true, &mut sq_samples);
+    assert_eq!(
+        sq.stats().enter_calls,
+        baseline_enters,
+        "warm sq-poll rtt entered kernel"
+    );
+    print_percentiles("sq-poll nop rtt", &mut sq_samples);
+    must(sq.shutdown());
+
+    let mut polled = mode_proactor(ProactorMode::io_poll());
+    idle_ticks(&mut polled, "io-poll idle tick");
+    must(polled.shutdown());
+
+    let (client, server) = tcp_pair();
+    let mut event = mode_proactor(ProactorMode::event_driven());
+    let mut io = socket_engine(&mut event);
+    let client_id = must(io.insert(client));
+    let server_id = must(io.insert(server));
+    assert_zero_alloc("event-driven tcp ping", || {
+        ping_pong(&mut event, &mut io, client_id, server_id, false);
+    });
+    let mut tcp_samples = [0_u128; 64];
+    for sample in &mut tcp_samples {
+        let started = Instant::now();
+        ping_pong(&mut event, &mut io, client_id, server_id, false);
+        *sample = started.elapsed().as_nanos();
+    }
+    print_percentiles("event-driven tcp ping-pong", &mut tcp_samples);
+    must(io.close(&mut event, client_id));
+    must(io.close(&mut event, server_id));
+    must(event.shutdown());
+
+    let (client, server) = tcp_pair();
+    let mut sq = mode_proactor(ProactorMode::sq_poll(sq_cpu));
+    let mut io = socket_engine(&mut sq);
+    let client_id = must(io.insert(client));
+    let server_id = must(io.insert(server));
+    ping_pong(&mut sq, &mut io, client_id, server_id, true);
+    let warmed = sq.stats().enter_calls;
+    assert_zero_alloc("sq-poll tcp ping", || {
+        ping_pong(&mut sq, &mut io, client_id, server_id, true);
+    });
+    assert_eq!(sq.stats().enter_calls, warmed, "sq-poll tcp ping entered");
+    let mut tcp_samples = [0_u128; 64];
+    for sample in &mut tcp_samples {
+        let started = Instant::now();
+        ping_pong(&mut sq, &mut io, client_id, server_id, true);
+        *sample = started.elapsed().as_nanos();
+    }
+    print_percentiles("sq-poll tcp ping-pong", &mut tcp_samples);
+    must(io.close(&mut sq, client_id));
+    must(io.close(&mut sq, server_id));
+    must(sq.shutdown());
+}
+
+fn bench_modes(c: &mut Criterion) {
+    let (_affinity, _, sq_cpu) = must(Affinity::pin_pair());
+    let mut group = c.benchmark_group("proactor_mode");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(20));
+    group.measurement_time(Duration::from_millis(100));
+    let mut event = mode_proactor(ProactorMode::event_driven());
+    group.bench_function("idle_tick_event_driven", |b| {
+        b.iter(|| black_box(must(event.tick(&mut ignore_completion))));
+    });
+    let mut payload = 10_u64;
+    group.bench_function("nop_rtt_event_driven", |b| {
+        b.iter(|| {
+            payload = payload.wrapping_add(1);
+            nop_once(&mut event, true, payload);
+        });
+    });
+    must(event.shutdown());
+    let mut sq = mode_proactor(ProactorMode::sq_poll(sq_cpu));
+    group.bench_function("idle_tick_sq_poll", |b| {
+        b.iter(|| black_box(must(sq.tick(&mut ignore_completion))));
+    });
+    group.bench_function("nop_rtt_sq_poll", |b| {
+        b.iter(|| {
+            payload = payload.wrapping_add(1);
+            nop_once(&mut sq, true, payload);
+        });
+    });
+    must(sq.shutdown());
+    let mut polled = mode_proactor(ProactorMode::io_poll());
+    group.bench_function("idle_tick_io_poll", |b| {
+        b.iter(|| black_box(must(polled.tick(&mut ignore_completion))));
+    });
+    must(polled.shutdown());
+    group.finish();
+}
+
 fn preflight() {
     preflight_slab();
     preflight_payload();
@@ -348,6 +703,7 @@ fn preflight() {
     preflight_buffers();
     preflight_files();
     preflight_socket();
+    preflight_modes();
 }
 
 criterion_group!(
@@ -357,7 +713,8 @@ criterion_group!(
     bench_proactor,
     bench_buffers,
     bench_files,
-    bench_socket
+    bench_socket,
+    bench_modes
 );
 
 fn main() {

@@ -14,6 +14,9 @@ use crate::{
     id::BufferId,
 };
 
+mod aligned;
+pub(crate) use aligned::DEFAULT_ALIGNMENT;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
@@ -25,9 +28,18 @@ enum State {
 }
 
 struct Slot {
-    bytes: UnsafeCell<Box<[u8]>>,
+    bytes: UnsafeCell<aligned::AlignedBytes>,
     state: Cell<State>,
     generation: Cell<u64>,
+}
+
+impl Slot {
+    fn allocation(&self) -> (*mut u8, usize) {
+        // SAFETY: The allocation address and length are fixed at construction.
+        // Reading them does not borrow the bytes the kernel may be accessing.
+        let bytes = unsafe { &*self.bytes.get() };
+        (bytes.as_ptr(), bytes.len())
+    }
 }
 
 struct Inner {
@@ -100,7 +112,8 @@ pub struct FixedBufferPool {
 impl FixedBufferPool {
     /// Allocate and register `buffer_count` zeroed buffers of `buffer_len` bytes.
     ///
-    /// Construction allocates memory; checkout and completion transitions do not.
+    /// Each buffer is aligned to 4096 bytes. Construction allocates memory;
+    /// checkout and completion transitions do not.
     ///
     /// # Errors
     /// Returns an error for a null ring, zero dimensions, lengths above `u32::MAX`,
@@ -119,8 +132,39 @@ impl FixedBufferPool {
         buffer_count: u16,
         buffer_len: usize,
     ) -> Result<Self> {
+        // SAFETY: The caller upholds the ring lifetime required by `with_alignment`.
+        unsafe { Self::with_alignment(ring, buffer_count, buffer_len, DEFAULT_ALIGNMENT) }
+    }
+
+    /// Allocate and register buffers aligned to a power-of-two `alignment`.
+    ///
+    /// Use the file's `statx` `stx_dio_mem_align` for `O_DIRECT`.
+    ///
+    /// # Errors
+    /// Returns an error for a null ring, a non-power-of-two alignment, zero
+    /// dimensions, lengths above `u32::MAX`, allocation failure, or a failed
+    /// kernel buffer registration.
+    ///
+    /// # Panics
+    /// This function does not intentionally panic.
+    ///
+    /// # Safety
+    /// `ring` must identify an initialized ring owned by this thread and outlive
+    /// this pool and every handle derived from it. No other owner may register,
+    /// update, or unregister its fixed buffers during that lifetime. Ring access
+    /// must remain serialized on this thread, including while handles are dropped.
+    pub unsafe fn with_alignment(
+        ring: *mut io_uring::IoUring,
+        buffer_count: u16,
+        buffer_len: usize,
+        alignment: usize,
+    ) -> Result<Self> {
         let ring = NonNull::new(ring).ok_or_else(|| error(libc::EINVAL))?;
-        if buffer_count == 0 || buffer_len == 0 || buffer_len > u32::MAX as usize {
+        if !alignment.is_power_of_two()
+            || buffer_count == 0
+            || buffer_len == 0
+            || buffer_len > u32::MAX as usize
+        {
             return Err(error(libc::EINVAL));
         }
         let count = usize::from(buffer_count);
@@ -136,14 +180,9 @@ impl FixedBufferPool {
             .try_reserve_exact(count)
             .map_err(|_| error(libc::ENOMEM))?;
         for id in 0..buffer_count {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(buffer_len)
-                .map_err(|_| error(libc::ENOMEM))?;
-            bytes.resize(buffer_len, 0);
-            let mut bytes = bytes.into_boxed_slice();
+            let bytes = aligned::AlignedBytes::allocate(buffer_len, alignment)?;
             iovecs.push(libc::iovec {
-                iov_base: bytes.as_mut_ptr().cast(),
+                iov_base: bytes.as_ptr().cast(),
                 iov_len: bytes.len(),
             });
             slots.push(Slot {
@@ -467,6 +506,38 @@ impl InFlightWaitingBuffer {
         self.generation
     }
 
+    /// Returns the stable base address of the registered allocation.
+    ///
+    /// Forming the pointer does not borrow the bytes. Do not dereference it
+    /// while the kernel owns the buffer.
+    ///
+    /// # Panics
+    /// Does not panic.
+    #[must_use]
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.inner.slots[usize::from(self.id.0)].allocation().0
+    }
+
+    /// Returns the registered allocation length in bytes.
+    ///
+    /// # Panics
+    /// Does not panic.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.slots[usize::from(self.id.0)].allocation().1
+    }
+
+    /// Reports whether the registered allocation is empty.
+    ///
+    /// Pool construction rejects a zero length, so a live token is never empty.
+    ///
+    /// # Panics
+    /// Does not panic.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Mark cancellation or abandonment without authorizing memory reuse.
     ///
     /// Repeated calls on the same quarantined operation succeed.
@@ -527,260 +598,4 @@ impl Drop for InFlightWaitingBuffer {
 }
 
 #[cfg(test)]
-mod unit_lifecycle_scenario {
-    use super::*;
-
-    fn pool(count: u16) -> FixedBufferPool {
-        let slots = (0..count)
-            .map(|_| Slot {
-                bytes: UnsafeCell::new(vec![0; 32].into_boxed_slice()),
-                state: Cell::new(State::Free),
-                generation: Cell::new(0),
-            })
-            .collect();
-        FixedBufferPool {
-            inner: Rc::new(Inner {
-                ring: NonNull::dangling(),
-                slots,
-                free: (0..count).rev().map(Cell::new).collect(),
-                free_len: Cell::new(usize::from(count)),
-                // A test registration without FFI: all operations stay in user space.
-                registered: Cell::new(true),
-                mock_registration: true,
-            }),
-        }
-    }
-
-    fn detach(pool: &FixedBufferPool) {
-        pool.inner.registered.set(false);
-    }
-
-    #[test]
-    fn free_stack_reuses_exact_capacity_in_return_order_without_resizing() -> Result<()> {
-        let pool = pool(3);
-        let allocation = pool.inner.free.as_ptr();
-        for _ in 0..1024 {
-            let first = pool.checkout()?;
-            let second = pool.checkout()?;
-            let third = pool.checkout()?;
-            let (first_id, second_id) = (first.id(), second.id());
-            assert_ne!(first_id, second_id);
-            assert_ne!(first_id, third.id());
-            assert_ne!(second_id, third.id());
-            assert_eq!(pool.available(), 0);
-            assert!(matches!(
-                pool.checkout(),
-                Err(UringError::FixedBuffersExhausted)
-            ));
-            drop(second);
-            drop(first);
-            let reused_first = pool.checkout()?;
-            let reused_second = pool.checkout()?;
-            assert_eq!(reused_first.id(), first_id);
-            assert_eq!(reused_second.id(), second_id);
-            drop((reused_first, reused_second, third));
-            assert_eq!(pool.available(), 3);
-            assert_eq!(pool.inner.free.as_ptr(), allocation);
-        }
-        detach(&pool);
-        Ok(())
-    }
-
-    #[test]
-    fn cancelled_buffers_stay_unavailable_until_target_completion() -> Result<()> {
-        let pool = pool(2);
-        let mut original = pool.checkout()?;
-        original.as_mut_slice()[0] = 91;
-        let original_id = original.id();
-        let address = original.as_ptr();
-        let mut waiting = original.into_in_flight();
-        waiting.quarantine()?;
-        waiting.quarantine()?;
-        drop(waiting);
-        let other = pool.checkout()?;
-        assert_ne!(other.id(), original_id);
-        assert!(pool.checkout().is_err());
-        assert_eq!(pool.available(), 0);
-        // SAFETY: This test never submits an SQE, so no kernel access exists.
-        unsafe { pool.reclaim_completed(original_id)? };
-        let recovered = pool.checkout()?;
-        assert_eq!(recovered.id(), original_id);
-        assert_eq!(recovered.as_ptr(), address);
-        assert_eq!(recovered.as_slice()[0], 91);
-        detach(&pool);
-        Ok(())
-    }
-
-    #[test]
-    fn stale_waiting_token_cannot_quarantine_a_reused_slot() -> Result<()> {
-        let pool = pool(1);
-        let old = pool.checkout()?.into_in_flight();
-        let id = old.id();
-        // SAFETY: No request was submitted; this simulates its final completion.
-        unsafe { pool.reclaim_completed(id)? };
-        let current = pool.checkout()?.into_in_flight();
-        drop(old);
-        // SAFETY: No kernel request references this buffer in this unit test.
-        let returned = unsafe { current.complete()? };
-        assert!(pool.checkout().is_err());
-        drop(returned);
-        assert_eq!(pool.available(), 1);
-        // SAFETY: There is no kernel request; the state must reject double reclaim.
-        let reclaimed_twice = unsafe { pool.reclaim_completed(id) };
-        assert!(matches!(
-            reclaimed_twice,
-            Err(UringError::BufferNotInFlight(_))
-        ));
-        detach(&pool);
-        Ok(())
-    }
-
-    #[test]
-    fn completion_returns_bytes_and_checked_out_drop_recycles_once() -> Result<()> {
-        let pool = pool(1);
-        let mut buffer = pool.checkout()?;
-        buffer.as_mut_slice()[..4].copy_from_slice(b"data");
-        let waiting = buffer.into_in_flight();
-        assert_eq!(pool.available(), 0);
-        // SAFETY: This test never makes the buffer accessible to the kernel.
-        let completed = unsafe { waiting.complete()? };
-        assert_eq!(&completed.as_slice()[..4], b"data");
-        drop(completed);
-        assert_eq!(pool.available(), 1);
-        let checked_out = pool.checkout()?;
-        // SAFETY: No kernel access exists; CheckedOut must reject reclamation.
-        let prematurely_reclaimed = unsafe { pool.reclaim_completed(checked_out.id()) };
-        assert!(matches!(
-            prematurely_reclaimed,
-            Err(UringError::BufferNotInFlight(_))
-        ));
-        drop(checked_out);
-        assert_eq!(pool.available(), 1);
-        detach(&pool);
-        Ok(())
-    }
-
-    #[test]
-    fn cancel_and_target_completion_orders_keep_reused_generation_isolated() -> Result<()> {
-        for cancel_first in [true, false] {
-            let pool = pool(1);
-            let mut waiting = pool.checkout()?.into_in_flight();
-            let id = waiting.id();
-            waiting.quarantine()?;
-            let mut replacement = None;
-            for target_final in [!cancel_first, cancel_first] {
-                if target_final {
-                    // SAFETY: No SQE is submitted in this unit state-machine
-                    // test; this event represents the target's own final CQE.
-                    unsafe { pool.reclaim_completed(id)? };
-                    replacement = Some(pool.checkout()?.into_in_flight());
-                } else {
-                    assert_eq!(pool.available(), 0);
-                    assert!(matches!(
-                        pool.checkout(),
-                        Err(UringError::FixedBuffersExhausted)
-                    ));
-                    assert!(matches!(
-                        pool.inner.slots[0].state.get(),
-                        State::Quarantined | State::InFlight
-                    ));
-                }
-            }
-            assert!(matches!(
-                waiting.quarantine(),
-                Err(UringError::BufferNotInFlight(_))
-            ));
-            drop(waiting);
-            assert_eq!(pool.inner.slots[0].state.get(), State::InFlight);
-            let replacement = replacement.ok_or(UringError::BufferNotInFlight(id.0))?;
-            // SAFETY: The replacement also remained in user space throughout;
-            // no kernel request or zero-copy notification can still access it.
-            drop(unsafe { replacement.complete()? });
-            assert_eq!(pool.available(), 1);
-            detach(&pool);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn spent_generation_retires_without_blocking_other_slots_or_unregister() -> Result<()> {
-        let mut pool = pool(2);
-        pool.inner.slots[0].generation.set(u64::MAX);
-        assert!(matches!(
-            pool.checkout(),
-            Err(UringError::Syscall {
-                errno: libc::EOVERFLOW,
-                ..
-            })
-        ));
-        assert_eq!(pool.inner.slots[0].state.get(), State::Retired);
-        assert_eq!(pool.available(), 1);
-        let remaining = pool.checkout()?;
-        assert_eq!(remaining.id(), BufferId(1));
-        assert!(pool.unregister().is_err());
-        drop(remaining);
-        pool.inner.slots[1].generation.set(u64::MAX);
-        assert!(matches!(
-            pool.checkout(),
-            Err(UringError::Syscall {
-                errno: libc::EOVERFLOW,
-                ..
-            })
-        ));
-        assert_eq!(pool.inner.slots[1].state.get(), State::Retired);
-        assert_eq!(pool.available(), 0);
-        assert!(matches!(
-            pool.checkout(),
-            Err(UringError::FixedBuffersExhausted)
-        ));
-        pool.unregister()?;
-        assert!(!pool.inner.registered.get());
-        Ok(())
-    }
-
-    #[test]
-    fn stale_completion_generation_cannot_reclaim_reused_in_flight_buffer() -> Result<()> {
-        let pool = pool(1);
-        let old = pool.checkout()?.into_in_flight();
-        let id = old.id();
-        let old_generation = old.generation();
-        // SAFETY: No SQE was submitted, so this operation has no kernel access.
-        unsafe { pool.reclaim_completed_generation(id, old_generation)? };
-        let current = pool.checkout()?.into_in_flight();
-        let current_generation = current.generation();
-        assert_ne!(old_generation, current_generation);
-        drop(old);
-        // SAFETY: The old operation never reached the kernel; only its stale
-        // identity is supplied, and rejection must preserve the current owner.
-        let stale = unsafe { pool.reclaim_completed_generation(id, old_generation) };
-        assert!(matches!(stale, Err(UringError::BufferNotInFlight(_))));
-        assert_eq!(pool.available(), 0);
-        assert_eq!(pool.inner.slots[0].state.get(), State::InFlight);
-        // SAFETY: The current operation also remained entirely in user space.
-        drop(unsafe { current.complete()? });
-        assert_eq!(pool.available(), 1);
-        detach(&pool);
-        Ok(())
-    }
-
-    #[test]
-    fn unregister_rejects_owned_and_quarantined_slots() -> Result<()> {
-        let mut pool = pool(1);
-        let checked_out = pool.checkout()?;
-        assert!(pool.unregister().is_err());
-        let mut waiting = checked_out.into_in_flight();
-        assert!(pool.unregister().is_err());
-        waiting.quarantine()?;
-        assert!(pool.unregister().is_err());
-        // SAFETY: No SQE was submitted, so no DMA or notification remains.
-        unsafe { pool.reclaim_completed(waiting.id())? };
-        assert!(matches!(
-            waiting.quarantine(),
-            Err(UringError::BufferNotInFlight(_))
-        ));
-        pool.unregister()?;
-        pool.unregister()?;
-        assert!(pool.checkout().is_err());
-        Ok(())
-    }
-}
+mod unit_lifecycle_scenario;
