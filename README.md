@@ -125,17 +125,89 @@ These paths allocate a slab slot without inserting or deleting a caller identity
 in the hash table. Retain the returned key for `cancel_key`; caller-identity
 lookup APIs apply to the payload-preserving preparation methods.
 
-Default optimized rings pair `DEFER_TASKRUN` with `TASKRUN_FLAG`.
-`poll_completions` flushes flagged deferred kernel work and CQ overflow before
-reading the CQ, retries interrupted flushes, and defers transient kernel backpressure.
-`submit()` publishes staged batches until staging drains or the kernel accepts
-no more entries. Thus `submit()` plus `poll_completions()`, or `tick()`, also progresses pending
-socket completions. No completion wait is required for this polling mode.
-`pending_cancel_count()` reports target-cancel acknowledgments still outstanding;
+## Ring modes
+
+`ProactorMode` is chosen once, when the ring opens.
+
+| Mode | Negotiated setup | Owner loop |
+| --- | --- | --- |
+| `EventDriven(EventDrivenConfig)` | `SINGLE_ISSUER\|COOP_TASKRUN\|DEFER_TASKRUN\|TASKRUN_FLAG`, then `SI\|COOP\|TASKRUN_FLAG`, then `COOP\|TASKRUN_FLAG`, then none | `wait_completions` blocks in the kernel. `no_iowait` skips iowait accounting on Linux 6.15+. `batch_wait_usec` coalesces wakeups on Linux 6.12+. |
+| `SqPoll(SqPollConfig)` | `SQPOLL\|SQ_AFF\|SINGLE_ISSUER` only | Spin on `tick`. Kernel thread `iou-sqp-<pid>` consumes SQEs. |
+| `IoPoll` | `IOPOLL\|SINGLE_ISSUER\|DEFER_TASKRUN\|TASKRUN_FLAG`, then `IOPOLL\|SINGLE_ISSUER`, then `IOPOLL` | Spin on `tick` for polled `O_DIRECT` reads and writes. |
+| `SqPollIoPoll(SqPollConfig)` | `SQPOLL\|SQ_AFF\|IOPOLL\|SINGLE_ISSUER` only | The SQ thread submits and reaps polled block I/O. |
+
+Caller `setup_flags` may add only `CLAMP`, `SUBMIT_ALL`, and `NO_SQARRAY`. The mode
+owns the polling and task-run bits. Polling modes require `enable_optimizations`.
+SQPOLL modes do not fall back to another mode. Each attempt tries
+`SUBMIT_ALL|NO_SQARRAY` first. A successful ring must advertise `EXT_ARG` and
+`NODROP`. A `SqPoll` ring must also advertise `SQPOLL_NONFIXED`.
+
+Pin the owner thread to one CPU and set `SqPollConfig::thread_cpu` to a different
+CPU. Construction fails when the owner's allowed set is exactly that SQ CPU. The
+library does not change the owner's affinity.
+
+The example and benchmark select the first two CPUs in the calling thread's
+allowed affinity mask, pin the owner to the first, and place the SQ thread on the
+second. An RAII guard restores the original mask. They report a clear error when
+fewer than two CPUs are allowed. The library leaves owner affinity to the caller.
+
+| Method | `EventDriven` | `SqPoll` | `IoPoll` | `SqPollIoPoll` |
+| --- | --- | --- | --- | --- |
+| `submit()` | Publish bounded batches and enter to flush SQEs until blocked. | Publish one bounded pass; wake the SQ thread if needed. | Publish bounded batches and enter with `GETEVENTS` to submit and poll block I/O. | Publish one bounded pass; the SQ thread submits and polls block I/O. |
+| `poll_completions()` | Flush flagged task work/overflow and harvest a CQ batch. | Harvest a CQ batch; service flagged task work/overflow. | Enter with `GETEVENTS` when pending I/O has no ready CQE, then harvest. | Harvest a CQ batch while the SQ thread polls; service flagged work/overflow. |
+| `wait_completions()` | Publish, wait in the kernel as requested, and harvest. | Only `(0, None)` is allowed and delegates to `tick()`. | Only `(0, None)` is allowed and delegates to `tick()`. | Only `(0, None)` is allowed and delegates to `tick()`. |
+| `tick()` | Submit, then harvest one bounded CQ batch. | Publish/wake as needed, then harvest. | Submit and poll pending block I/O, then harvest. | Publish/wake as needed, then harvest while the SQ thread polls. |
+
+In every mode, `submit()` returns the count of SQEs newly published from staging
+into the SQ ring during that call. Kernel consumption and previously published
+SQEs do not contribute to this count. `EINTR`, `EAGAIN`, and `EBUSY` from
+`io_uring_enter` preserve `Ok(published)` and pending SQ entries. They do not
+trigger an error-retry loop: bounded batching continues only with visible SQ-head
+progress; otherwise flushing is deferred to a later `submit()`, `tick()`, or
+eligible wait. An SQ thread reads descriptors and operand bytes after publication,
+so those operands remain alive until their terminal CQEs.
+
+`poll_completions()` advances kernel completion work without submitting pending
+application SQEs on owner-driven rings. After harvesting, it publishes staging,
+including callback follow-up SQEs, in all four modes. In `SqPoll` and
+`SqPollIoPoll`, publication also wakes a sleeping SQ thread as needed. In
+`EventDriven` and `IoPoll`, call `submit()`, `tick()`, or an eligible wait to flush
+those published follow-ups. `DEFER_TASKRUN` is paired with `TASKRUN_FLAG` so
+flagged deferred work and CQ overflow are flushed before harvesting.
+
+Calling `wait_completions(min_complete, timeout, ...)` in any busy-polling mode
+with `min_complete > 0` or `timeout.is_some()` returns
+`Err(UringError::BlockingWaitUnavailable { mode })` before publication or dispatch.
+`wait_completions(0, None, ...)` performs a nonblocking tick in every mode.
+
+A fully idle `tick()` performs zero syscalls in `EventDriven` and `SqPoll`
+(and in both IOPOLL modes), with no SQ-tail store or `SeqCst` fence. Pending
+kernel work or overflow can require an enter even with empty staging. In `IoPoll`,
+when `operation_count() > 0`, the CQ is empty, and no SQE needs submission, `tick()`
+issues `io_uring_enter(0, 0, IORING_ENTER_GETEVENTS)` to poll the block driver's
+completion queues. Private drive strategies are `Interrupt`, `SqThread`, and
+`SyscallPoll` for event-driven, SQ-thread, and owner-polled modes respectively.
+
+`OpcodeSet::IOPOLL` admits NOP and polled read/write opcodes. `IoPoll` and
+`SqPollIoPoll` reject sockets, timers, and cancellation. An `IOPOLL` ring and a
+successful NOP establish ring support; actual `O_DIRECT` reads and writes also
+require hardware poll queues on the backing block device and filesystem support.
+For NVMe, enable queues with `nvme.poll_queues=N` and check
+`/sys/block/<dev>/queue/io_poll == 1`. Without that support, real I/O can complete
+with `-EOPNOTSUPP` even though ring setup and NOP succeed.
+
+An unallocated sparse-file hole can take a kernel zero-fill shortcut and does
+not verify device polling. `DirectFile::supports_polled_io()` checks the backing
+queue's advertised `io_poll` capability through sysfs, using `st_rdev` for raw
+block devices and the filesystem's `st_dev` for regular files. Qualify the complete path
+with a real preallocated, initialized `O_DIRECT` polled read on the target device.
+Construction checks `O_DIRECT` and alignment; advertised capability alone does
+not prove that a specific filesystem/device read succeeds.
+
+`pending_cancel_count()` counts target-cancel acknowledgments still outstanding.
 `is_idle()` requires empty staging, no application operations, no target-cancel
 acknowledgments, and no outstanding shutdown-cancel request. `remaining_capacity()`
-counts staging credit and reusable slab slots; exhausted generations contribute
-no credit.
+counts staging credit and reusable slab slots; exhausted generations give no credit.
 
 ## Operation and Buffer Ownership
 
@@ -162,6 +234,34 @@ leases return. Completion dispatchers use `receive_with_context` and
 after returning any selected receive lease. `BufferRing` and
 `BufferLease` are also exported from the crate root.
 
+`FixedBufferPool::new(ring, buffer_count, buffer_len)` provides 4096-byte-aligned
+storage for direct I/O. `FixedBufferPool::with_alignment(ring, buffer_count,
+buffer_len, alignment)` selects an explicit power-of-two alignment. The raw `ring`
+argument is a live `*mut IoUring` and both constructors are unsafe: their pool and
+detached-handle lifetimes must remain within the ring's lifetime.
+`Proactor::configure_direct_buffers(count, buffer_len, alignment)` registers
+an aligned proactor-owned pool and returns `Result<()>`.
+
+`DirectFile::open(path: &Path, access: DirectAccess) -> Result<DirectFile>` accepts
+`DirectAccess::ReadOnly` or `DirectAccess::ReadWrite`.
+`DirectFile::from_owned_fd(fd: OwnedFd) -> Result<DirectFile>` takes an existing
+descriptor. Both constructors validate `O_DIRECT` and query direct-I/O alignment.
+`read_fixed` and `write_fixed` retain the descriptor and in-flight buffer through
+its terminal completion; their `_with_context` variants stage callback follow-ups.
+Buffers, lengths, and offsets must meet file alignment. Raw `ops::fs` helpers are
+`prep_read`, `prep_write`, `prep_readv`, `prep_writev`, `prep_read_fixed`,
+`prep_write_fixed`, `prep_readv_fixed`, and `prep_writev_fixed`; callers retain all
+raw pointer operands and vector descriptors through the final completion.
+The scalar helpers `prep_read`, `prep_write`, `prep_read_fixed`, and
+`prep_write_fixed` take `len: u32`; convert larger host lengths with
+`u32::try_from` before preparation. `DirectFile` performs that checked conversion.
+For `prep_readv_fixed` and `prep_writev_fixed`, the iovec descriptor array may live
+in ordinary user memory. Keep it readable and immutable through kernel
+submission, which can occur after `submit()` returns under SQPOLL; retaining it
+through the final CQE is sufficient. Each described payload range must lie within
+the one registered buffer at `buf_index`. Those ranges remain valid through the
+final CQE, exclusively writable for reads and readable/immutable for writes.
+
 Fixed-buffer checkout and return use a preallocated stack of slot IDs with
 `Cell` state; they allocate no storage and perform no runtime borrow checking.
 
@@ -170,12 +270,27 @@ Raw pool APIs expose additional lifetime obligations. In particular,
 proactor's lifetime and return or transfer them before teardown. Follow each
 method's safety contract when managing registration or raw DMA directly.
 
-`shutdown_with(&mut dispatcher)` cancels and drains while preserving caller-owned
-state. Teardown callbacks have zero staging credit. `shutdown()` discards
-business completions. Teardown errors preserve pending resource ownership rather
-than treating an unconfirmed cancellation as permission to recycle DMA storage.
-Shutdown drains all ready CQEs regardless of the normal batch limit, sends one
-global cancellation request across retries, and bounds only waits without progress.
+`shutdown_with(&mut dispatcher)` delivers teardown completions through caller-owned
+state; `shutdown()` discards business completions. Both discard unpublished
+staging locally with synthetic `-ECANCELED` completions and zero callback staging
+credit. Published targets drain naturally in IOPOLL modes; `EventDriven` and
+`SqPoll` issue one global cancellation request across retries. All ready CQEs are
+drained regardless of the normal batch limit.
+
+The default consecutive stall budget is 320ms for `EventDriven` and `SqPoll`, and
+5s for `IoPoll` and `SqPollIoPoll`. `shutdown_stall_timeout` overrides it; every
+harvested CQE resets the stall timer. `IoPoll` retries unconsumed SQ entries and
+uses user-space `spin_loop()` after polling. The other three modes use internal
+`kernel_wait_private` waits of 10ms per idle pass. This is a no-progress budget,
+not a bound on total teardown time while completions keep arriving.
+
+If the kernel/device stops completing targets for the configured budget,
+`shutdown()` returns `Err(UringError::Wait(libc::ETIMEDOUT))`. Pending operation
+metadata, DMA buffers, and retained descriptors remain owned for a safe retry.
+`Drop` invokes `shutdown()` on the owner thread and can spend the same stall
+budget. If teardown still fails, it intentionally leaks the pending resource
+and operation owners rather than free memory the kernel may still access.
+An unconfirmed cancellation never permits DMA reuse.
 
 On the supported Linux x86_64 target, the buffer-ring tail and descriptor fields
 use aligned volatile accesses. A compiler memory barrier precedes tail publication,
@@ -191,11 +306,13 @@ print a summary, and exit. Required kernel capabilities fail visibly.
 | `proactor_subsystems` | Shared worker routing, callback staging, and shutdown through caller-owned state. |
 | `fixed_files_and_buffer_ring_tcp_echo` | Fixed-file growth, direct close, fixed sends, and multishot receive buffer recovery. |
 | `completion_socket_io` | TCP and Unix receive/send completions, zero-copy release, and socket close. |
+| `proactor_modes` | Event-driven blocking wait, warm SQPOLL NOPs with no additional enters, five drive counters, affinity selection, and IOPOLL shutdown. |
 
 ```bash
-cargo run -p liburing --example proactor_subsystems
-cargo run -p liburing --example fixed_files_and_buffer_ring_tcp_echo
-cargo run -p liburing --example completion_socket_io
+cargo run -p liburing-proactor --example proactor_subsystems
+cargo run -p liburing-proactor --example fixed_files_and_buffer_ring_tcp_echo
+cargo run -p liburing-proactor --example completion_socket_io
+cargo run -p liburing-proactor --example proactor_modes
 ```
 
 ## Build and Test

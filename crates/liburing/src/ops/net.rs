@@ -1,4 +1,7 @@
-//! Allocation-free network, cancellation, poll, and registered-I/O SQE builders.
+//! Allocation-free network, cancellation, and poll SQE builders.
+//!
+//! Fixed-buffer file reads and writes live in [`super::fs`] and are re-exported
+//! here so existing `ops::net` callers keep compiling.
 //!
 //! Preparation only initializes an exclusively owned SQE. Submission and resource
 //! retention belong to the caller. Cancellation never shortens the target's DMA
@@ -10,6 +13,8 @@ use std::os::fd::RawFd;
 
 use io_uring::{opcode, types};
 
+pub use super::fs::{prep_read_fixed, prep_write_fixed};
+use super::write_entry;
 use crate::{
     backend::RawSqe,
     id::{BufferGroupId, BufferId, OperationId, UringFileSlot},
@@ -467,84 +472,6 @@ pub unsafe fn prep_close_direct(sqe: *mut RawSqe, slot: UringFileSlot) {
     unsafe {
         write_entry(sqe, opcode::Close::new(types::Fd(0)).build());
         (*sqe).splice_fd_in = (slot.raw() + 1) as i32;
-    }
-}
-
-/// Prepares reading into registered buffer `buffer` at file byte `offset`.
-///
-/// # Errors
-/// Preparation reports no errors; the operation result is returned in its CQE.
-///
-/// # Panics
-/// Does not panic.
-///
-/// # Safety
-/// `sqe` must point to one initialized, exclusively owned, writable SQE that
-/// has not been published. `buf..buf+len` must lie within the registered `buffer` allocation and
-/// remain exclusively writable through the target final CQE. Transition its
-/// handle to in-flight before publishing this SQE.
-pub unsafe fn prep_read_fixed(
-    sqe: *mut RawSqe,
-    fd: RawFd,
-    buf: *mut u8,
-    len: u32,
-    offset: u64,
-    buffer: BufferId,
-) {
-    // SAFETY: The caller owns initialized SQE storage and retains all referenced
-    // descriptors and DMA operands through the target final completion.
-    unsafe {
-        write_entry(
-            sqe,
-            opcode::ReadFixed::new(types::Fd(fd), buf, len, buffer.raw())
-                .offset(offset)
-                .build(),
-        );
-    }
-}
-
-/// Prepares writing registered buffer `buffer` at file byte `offset`.
-///
-/// # Errors
-/// Preparation reports no errors; the operation result is returned in its CQE.
-///
-/// # Panics
-/// Does not panic.
-///
-/// # Safety
-/// `sqe` must point to one initialized, exclusively owned, writable SQE that
-/// has not been published. `buf..buf+len` must lie within the registered `buffer` allocation and
-/// remain readable and immutable through the target final CQE. Transition
-/// its handle to in-flight before publishing this SQE.
-pub unsafe fn prep_write_fixed(
-    sqe: *mut RawSqe,
-    fd: RawFd,
-    buf: *const u8,
-    len: u32,
-    offset: u64,
-    buffer: BufferId,
-) {
-    // SAFETY: The caller owns initialized SQE storage and retains all referenced
-    // descriptors and DMA operands through the target final completion.
-    unsafe {
-        write_entry(
-            sqe,
-            opcode::WriteFixed::new(types::Fd(fd), buf, len, buffer.raw())
-                .offset(offset)
-                .build(),
-        );
-    }
-}
-
-unsafe fn write_entry(sqe: *mut RawSqe, entry: io_uring::squeue::Entry) {
-    // SAFETY: The caller supplies initialized, exclusively writable SQE storage.
-    // Copying the 64-byte entry transfers no pointer or descriptor ownership.
-    unsafe {
-        let (identity, flags, personality) = ((*sqe).user_data, (*sqe).flags, (*sqe).personality);
-        *sqe = RawSqe::from_entry(entry);
-        (*sqe).user_data = identity;
-        (*sqe).flags |= flags;
-        (*sqe).personality = personality;
     }
 }
 

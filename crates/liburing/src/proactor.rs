@@ -2,12 +2,12 @@
 
 use std::{collections::VecDeque, marker::PhantomData, mem::ManuallyDrop, rc::Rc, time::Duration};
 
-use io_uring::{IoUring, cqueue, types};
+use io_uring::{IoUring, cqueue};
 
 use crate::{
     OperationId, Result, SubsystemId, UringError,
-    backend::{self, RawSqe, SynchronousTaskrun},
-    config::{KernelFeatures, ProactorConfig},
+    backend::RawSqe,
+    config::{KernelFeatures, OpcodeSet, ProactorConfig, ProactorMode},
     fixed_buffers::InFlightWaitingBuffer,
     operation::{PendingBuffer, StagedSqe, TrackedOperation},
     operation_slab::{OperationKey, OperationSlab, OperationState},
@@ -16,7 +16,12 @@ use crate::{
 
 pub(crate) mod resources;
 use resources::Resources;
+mod drive;
+mod setup;
 mod shutdown;
+mod stats;
+use drive::Drive;
+pub use stats::ProactorStats;
 const INTERNAL_CANCEL: u64 = 2;
 pub(crate) const INTERNAL_TARGET_CANCEL: u64 = 3;
 
@@ -25,6 +30,9 @@ pub struct Proactor {
     ring: Option<Box<IoUring>>,
     config: ProactorConfig,
     features: KernelFeatures,
+    mode: ProactorMode,
+    drive: Drive,
+    stats: ProactorStats,
     staged: VecDeque<StagedSqe>,
     operations: Option<OperationSlab<TrackedOperation>>,
     identities: crate::identity_map::IdentityMap,
@@ -40,12 +48,15 @@ pub struct Proactor {
 struct CompletionBatch<'a> {
     queue: ManuallyDrop<cqueue::CompletionQueue<'a>>,
     dispatching: &'a mut bool,
+    consumed: usize,
 }
 impl Drop for CompletionBatch<'_> {
     fn drop(&mut self) {
         // One CQ-head release store per consumed batch, including unwind paths.
         // ManuallyDrop suppresses the queue's otherwise duplicated head store.
-        self.queue.sync();
+        if self.consumed != 0 {
+            self.queue.sync();
+        }
         *self.dispatching = false;
     }
 }
@@ -134,7 +145,7 @@ impl Proactor {
 
     /// Cancels exactly one generation, rejecting stale keys without side effects.
     /// # Errors
-    /// Returns staging, submission, or closed-ring errors for a current target.
+    /// Returns mode, staging, submission, or closed-ring errors for a current target.
     /// # Panics
     /// Does not panic.
     pub fn cancel_key(&mut self, key: OperationKey) -> Result<bool> {
@@ -144,6 +155,11 @@ impl Proactor {
             .is_none_or(|operations| operations.get(key).is_err())
         {
             return Ok(false);
+        }
+        if !self.mode.supports_cancellation() {
+            return Err(UringError::CancellationUnavailable {
+                mode: self.mode.name(),
+            });
         }
         self.ensure_open()?;
         if self.staged.len() == self.config.staged_capacity {
@@ -156,15 +172,14 @@ impl Proactor {
     /// Internal control acknowledgments never retire the target or reach business
     /// dispatch. This remains usable when every application operation is occupied.
     /// # Errors
-    /// Returns submission, staging-capacity, or closed-ring errors.
+    /// Returns mode, submission, staging-capacity, or closed-ring errors.
     /// # Panics
     /// Does not panic.
     pub fn cancel(&mut self, target: OperationId) -> Result<bool> {
-        self.ensure_open()?;
-        if self.staged.len() == self.config.staged_capacity {
-            self.submit()?;
-        }
-        self.context()?.cancel(target)
+        let Some(&key) = self.identities.get(&target) else {
+            return Ok(false);
+        };
+        self.cancel_key(key)
     }
 
     /// Retains a descriptor and DMA token until the operation's terminal CQE.
@@ -202,93 +217,22 @@ impl Proactor {
     }
 
     /// Creates a pure Rust ring and probes optional task-run optimizations.
+    /// Pin the owner before construction. Preserve a separate SQ-thread CPU
+    /// throughout the ring lifetime; later affinity changes cannot be detected.
     /// # Errors
-    /// Returns configuration, ring setup, or eventfd errors.
+    /// Returns configuration, affinity, required-feature, or ring setup errors.
     /// # Panics
     /// May panic if allocating fixed initialization budgets fails.
     pub fn new(config: ProactorConfig) -> Result<Self> {
         config.validate()?;
-        let optimization = backend::IORING_SETUP_SINGLE_ISSUER
-            | backend::IORING_SETUP_COOP_TASKRUN
-            | backend::IORING_SETUP_DEFER_TASKRUN;
-        let allowed = optimization | (1 << 7) | (1 << 9) | (1 << 16) | (1 << 4);
-        if config.setup_flags & !allowed != 0 {
-            return Err(UringError::InvalidConfig("unsupported ring setup flags"));
-        }
-        let mut flags = config.setup_flags
-            | if config.enable_optimizations {
-                optimization
-            } else {
-                0
-            };
-        let ring = loop {
-            if flags & backend::IORING_SETUP_DEFER_TASKRUN != 0 {
-                flags |= backend::IORING_SETUP_TASKRUN_FLAG;
-            }
-            let mut builder = IoUring::builder();
-            if let Some(entries) = config.cq_entries {
-                builder.setup_cqsize(entries);
-            }
-            if flags & backend::IORING_SETUP_SINGLE_ISSUER != 0 {
-                builder.setup_single_issuer();
-            }
-            if flags & backend::IORING_SETUP_COOP_TASKRUN != 0 {
-                builder.setup_coop_taskrun();
-            }
-            if flags & backend::IORING_SETUP_DEFER_TASKRUN != 0 {
-                builder.setup_defer_taskrun();
-            }
-            if flags & (1 << 7) != 0 {
-                builder.setup_submit_all();
-            }
-            if flags & backend::IORING_SETUP_TASKRUN_FLAG != 0 {
-                builder.setup_taskrun_flag();
-            }
-            if flags & (1 << 16) != 0 {
-                builder.setup_no_sqarray();
-            }
-            if flags & (1 << 4) != 0 {
-                builder.setup_clamp();
-            }
-            match builder.build(config.entries) {
-                Ok(ring) => break ring,
-                Err(error) => {
-                    let removable = [
-                        backend::IORING_SETUP_DEFER_TASKRUN,
-                        backend::IORING_SETUP_COOP_TASKRUN,
-                        backend::IORING_SETUP_SINGLE_ISSUER,
-                    ]
-                    .into_iter()
-                    .find(|bit| flags & bit != 0 && config.setup_flags & bit == 0);
-                    if error.raw_os_error() != Some(libc::EINVAL)
-                        || !config.enable_optimizations
-                        || removable.is_none()
-                    {
-                        return Err(UringError::RingInit(errno(&error)));
-                    }
-                    if let Some(bit) = removable {
-                        flags &= !bit;
-                        if bit == backend::IORING_SETUP_DEFER_TASKRUN
-                            && config.setup_flags & backend::IORING_SETUP_TASKRUN_FLAG == 0
-                        {
-                            flags &= !backend::IORING_SETUP_TASKRUN_FLAG;
-                        }
-                    }
-                }
-            }
-        };
-        let params = ring.params();
-        let features = KernelFeatures {
-            setup_flags: flags,
-            features: u32::from(params.is_feature_single_mmap())
-                | (u32::from(params.is_feature_nodrop()) << 1)
-                | (u32::from(params.is_feature_submit_stable()) << 2)
-                | (u32::from(params.is_feature_ext_arg()) << 8),
-        };
+        let (ring, features) = setup::create(config)?;
         Ok(Self {
             ring: Some(Box::new(ring)),
             config,
             features,
+            mode: config.mode,
+            drive: Drive::for_mode(config.mode),
+            stats: ProactorStats::default(),
             staged: VecDeque::with_capacity(config.staged_capacity),
             operations: Some(OperationSlab::new(config.operation_capacity)?),
             identities: crate::identity_map::IdentityMap::new(config.operation_capacity)?,
@@ -369,31 +313,6 @@ impl Proactor {
             unsafe { crate::ops::prep_nop(sqe) };
         })
     }
-    /// Publishes staged batches without waiting for completions.
-    /// Stops if the kernel accepts no entries, retaining the remaining staging.
-    /// # Errors
-    /// Returns submission or closed-ring errors.
-    /// # Panics
-    /// Does not panic.
-    pub fn submit(&mut self) -> Result<usize> {
-        if self.dispatching {
-            return Err(UringError::ReentrantDispatch);
-        }
-        let mut total = 0;
-        loop {
-            self.flush_staged()?;
-            let submitted = self
-                .ring
-                .as_ref()
-                .ok_or(UringError::InvalidConfig("ring is closed"))?
-                .submit()
-                .map_err(|error| UringError::Submit(errno(&error)))?;
-            total += submitted;
-            if submitted == 0 || self.staged.is_empty() {
-                return Ok(total);
-            }
-        }
-    }
     /// Dispatches a bounded mmap CQ batch through caller-owned static state.
     /// # Errors
     /// Returns operation-state or dispatcher errors after acknowledging consumed CQEs.
@@ -407,6 +326,15 @@ impl Proactor {
         if self.dispatching {
             return Err(UringError::ReentrantDispatch);
         }
+        self.advance_kernel(false)?;
+        self.harvest(max_batch, dispatcher)
+    }
+
+    fn harvest<D: CompletionDispatcher<Kind> + ?Sized, Kind>(
+        &mut self,
+        max_batch: usize,
+        dispatcher: &mut D,
+    ) -> Result<usize> {
         let Self {
             ring,
             operations,
@@ -418,24 +346,12 @@ impl Proactor {
             shutting_down,
             cancel_armed,
             pending_cancels,
-            features,
+            mode,
             ..
         } = self;
         let ring = ring
             .as_mut()
             .ok_or(UringError::InvalidConfig("ring is closed"))?;
-        let flush_kernel = {
-            let submission = ring.submission();
-            submission.cq_overflow()
-                || (features.setup_flags & backend::IORING_SETUP_DEFER_TASKRUN != 0
-                    && (features.setup_flags & backend::IORING_SETUP_TASKRUN_FLAG == 0
-                        || submission.taskrun()))
-        };
-        if flush_kernel {
-            ring.submitter()
-                .synchronous_taskrun()
-                .map_err(|error| UringError::Wait(errno(&error)))?;
-        }
         let operations = operations
             .as_mut()
             .ok_or(UringError::InvalidConfig("operation table is closed"))?;
@@ -446,6 +362,7 @@ impl Proactor {
         let mut batch = CompletionBatch {
             queue: ManuallyDrop::new(ring.completion()),
             dispatching,
+            consumed: 0,
         };
         let mut harvested = 0;
         while harvested < max_batch {
@@ -453,6 +370,7 @@ impl Proactor {
                 break;
             };
             harvested += 1;
+            batch.consumed += 1;
             let id = OperationId::from_raw(cqe.user_data());
             if id.subsystem_id() == crate::SubsystemId::INTERNAL {
                 if id.raw() == INTERNAL_CANCEL {
@@ -496,65 +414,15 @@ impl Proactor {
                 resources,
                 pending_cancels,
                 current_completion: Some(completion),
+                admission: OpcodeSet::for_mode(*mode),
+                cancellable: mode.supports_cancellation(),
+                mode_name: mode.name(),
             };
             dispatcher.dispatch(completion, &mut context)?;
         }
         drop(batch);
-        self.flush_staged()?;
+        self.publish()?;
         Ok(harvested)
-    }
-    /// Submits and waits with an optional kernel-backed relative bound.
-    /// # Errors
-    /// Returns submission, wait, or dispatcher errors.
-    /// # Panics
-    /// Propagates dispatcher panics with batch invariants restored.
-    pub fn wait_completions<D: CompletionDispatcher<Kind> + ?Sized, Kind>(
-        &mut self,
-        min_complete: u32,
-        timeout: Option<Duration>,
-        dispatcher: &mut D,
-    ) -> Result<usize> {
-        if min_complete as usize > self.config.max_cqe_batch {
-            return Err(UringError::InvalidConfig(
-                "wait count exceeds completion batch",
-            ));
-        }
-        self.submit()?;
-        let ring = self
-            .ring
-            .as_ref()
-            .ok_or(UringError::InvalidConfig("ring is closed"))?;
-        let result = match timeout {
-            Some(duration) => {
-                let timespec = types::Timespec::from(duration);
-                ring.submitter().submit_with_args(
-                    min_complete as usize,
-                    &types::SubmitArgs::new().timespec(&timespec),
-                )
-            }
-            None => ring.submit_and_wait(min_complete as usize),
-        };
-        if let Err(error) = result
-            && !matches!(
-                error.raw_os_error(),
-                Some(libc::ETIME | libc::EINTR | libc::EAGAIN | libc::EBUSY)
-            )
-        {
-            return Err(UringError::Wait(errno(&error)));
-        }
-        self.poll_completions(self.config.max_cqe_batch, dispatcher)
-    }
-    /// Submits and dispatches one nonblocking completion batch.
-    /// # Errors
-    /// Returns submission or dispatcher errors.
-    /// # Panics
-    /// Propagates dispatcher panics.
-    pub fn tick<D: CompletionDispatcher<Kind> + ?Sized, Kind>(
-        &mut self,
-        dispatcher: &mut D,
-    ) -> Result<usize> {
-        self.submit()?;
-        self.poll_completions(self.config.max_cqe_batch, dispatcher)
     }
     /// Counts operations retained until final target or notification completion.
     /// # Errors
@@ -638,6 +506,9 @@ impl Proactor {
                 .ok_or(UringError::InvalidConfig("resources are closed"))?,
             pending_cancels: &mut self.pending_cancels,
             current_completion: None,
+            admission: OpcodeSet::for_mode(self.mode),
+            cancellable: self.mode.supports_cancellation(),
+            mode_name: self.mode.name(),
         })
     }
     fn ensure_open(&self) -> Result<()> {
@@ -646,23 +517,6 @@ impl Proactor {
         } else {
             Ok(())
         }
-    }
-    fn flush_staged(&mut self) -> Result<()> {
-        let ring = self
-            .ring
-            .as_mut()
-            .ok_or(UringError::InvalidConfig("ring is closed"))?;
-        let mut sq = ManuallyDrop::new(ring.submission());
-        while let Some(entry) = self.staged.front() {
-            // SAFETY: Slab metadata retains owned DMA tokens through terminal CQE;
-            // raw operand lifetimes remain the submitter's explicit obligation.
-            if unsafe { sq.push(&entry.sqe.into_entry()) }.is_err() {
-                break;
-            }
-            self.staged.pop_front();
-        }
-        sq.sync();
-        Ok(())
     }
 }
 fn errno(error: &std::io::Error) -> i32 {

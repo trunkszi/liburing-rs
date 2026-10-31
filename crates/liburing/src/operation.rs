@@ -5,6 +5,7 @@ use std::{collections::VecDeque, os::fd::OwnedFd, rc::Rc};
 use crate::{
     OperationId, Result, SubsystemId, UringError,
     backend::{self, RawSqe},
+    config::OpcodeSet,
     fixed_buffers::InFlightWaitingBuffer,
     operation_slab::{OperationKey, OperationKind, OperationSlab},
 };
@@ -47,7 +48,13 @@ pub(crate) struct StagedSqe {
     pub(crate) key: Option<OperationKey>,
 }
 
-pub(crate) fn validate(sqe: &RawSqe) -> Result<()> {
+pub(crate) fn validate(sqe: &RawSqe, admission: OpcodeSet, mode_name: &'static str) -> Result<()> {
+    if !admission.contains(sqe.opcode) {
+        return Err(UringError::OpcodeNotAdmitted {
+            opcode: sqe.opcode,
+            mode: mode_name,
+        });
+    }
     if u32::from(sqe.flags)
         & (backend::IOSQE_IO_DRAIN | backend::IOSQE_IO_LINK | backend::IOSQE_IO_HARDLINK)
         != 0
@@ -74,9 +81,12 @@ pub(crate) enum OperationIdentity {
     Keyed(SubsystemId),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn stage(
     staged: &mut VecDeque<StagedSqe>,
     capacity: usize,
+    admission: OpcodeSet,
+    mode_name: &'static str,
     operations: &mut OperationSlab<TrackedOperation>,
     identities: &mut crate::identity_map::IdentityMap,
     identity: OperationIdentity,
@@ -99,7 +109,7 @@ pub(crate) fn stage(
     if staged.len() == capacity {
         return Err(UringError::SqRingFull);
     }
-    validate(&sqe)?;
+    validate(&sqe, admission, mode_name)?;
     let kind = if matches!(
         sqe.opcode,
         io_uring::opcode::SendZc::CODE | io_uring::opcode::SendMsgZc::CODE

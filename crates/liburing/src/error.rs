@@ -10,6 +10,16 @@ pub type Result<T> = core::result::Result<T, UringError>;
 /// Numeric syscall errors are positive Linux errno values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum UringError {
+    #[error("[proactor.mode] opcode {opcode} is not admitted in {mode} mode")]
+    OpcodeNotAdmitted { opcode: u8, mode: &'static str },
+    #[error("[proactor.mode] blocking wait is unavailable in {mode} mode")]
+    BlockingWaitUnavailable { mode: &'static str },
+    #[error("[proactor.mode] submitted operations cannot be cancelled in {mode} mode")]
+    CancellationUnavailable { mode: &'static str },
+    #[error("[proactor.completion] kernel dropped completions")]
+    CompletionsDropped,
+    #[error("[proactor.sq-thread] kernel SQ thread is gone")]
+    SqThreadGone,
     /// Ring creation failed.
     #[error("ring initialization failed with errno {0}")]
     RingInit(i32),

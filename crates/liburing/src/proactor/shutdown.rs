@@ -1,5 +1,7 @@
 //! Bounded cancellation and final-CQE draining without business-state ownership.
 
+use std::time::Instant;
+
 use io_uring::opcode;
 
 use super::*;
@@ -62,8 +64,22 @@ impl Proactor {
         }
         self.submit()?;
         let mut cancel_issued = self.shutdown_cancel_issued || self.cancel_armed;
-        let mut idle_waits = 0;
+        let limit = self
+            .config
+            .shutdown_stall_timeout
+            .unwrap_or_else(|| self.mode.default_shutdown_stall());
+        let mut stalled_since: Option<Instant> = None;
         loop {
+            // A transient enter failure can leave published SQEs unconsumed;
+            // owner-polled progress must retry submission as well as reap CQEs.
+            if self.mode == ProactorMode::IoPoll
+                && self
+                    .ring
+                    .as_mut()
+                    .is_some_and(|ring| !ManuallyDrop::new(ring.submission()).is_empty())
+            {
+                self.submit()?;
+            }
             let harvested = self.poll_completions(usize::MAX, dispatcher)?;
             if self.operation_count() == 0 && !self.cancel_armed && self.pending_cancels == 0 {
                 // All target DMA and control requests retired before unregistering.
@@ -72,7 +88,10 @@ impl Proactor {
                 drop(self.ring.take());
                 return Ok(());
             }
-            if !cancel_issued {
+            if harvested != 0 {
+                stalled_since = None;
+            }
+            if self.mode.supports_cancellation() && !cancel_issued {
                 let mut raw = RawSqe::from_entry(
                     opcode::AsyncCancel::new(0)
                         .build()
@@ -94,16 +113,22 @@ impl Proactor {
                 }
                 drop(sq);
                 self.submit()?;
-                continue;
+                if cancel_issued {
+                    continue;
+                }
             }
             if harvested != 0 {
                 continue;
             }
-            if idle_waits == 32 {
+            let since = stalled_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= limit {
                 return Err(UringError::Wait(libc::ETIMEDOUT));
             }
-            idle_waits += 1;
-            self.wait_completions(1, Some(Duration::from_millis(10)), dispatcher)?;
+            if self.mode.uses_iopoll() && !self.mode.uses_sq_thread() {
+                core::hint::spin_loop();
+            } else {
+                self.kernel_wait_private(Duration::from_millis(10))?;
+            }
         }
     }
 }
@@ -125,50 +150,5 @@ impl Drop for Proactor {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn global_cancel_survives_dispatch_failure_without_reissuing_on_retry() -> Result<()> {
-        let timeout = crate::ops::Timeout::new(Duration::from_secs(60))?;
-        let mut proactor = Proactor::new(ProactorConfig {
-            entries: 64,
-            operation_capacity: 64,
-            staged_capacity: 64,
-            max_cqe_batch: 1,
-            ..ProactorConfig::default()
-        })?;
-        for payload in 0..48 {
-            proactor.prepare_sqe_with(
-                OperationId::pack(SubsystemId(1), crate::OperationPayload(payload)),
-                |sqe| {
-                    // SAFETY: The immutable timeout owner precedes the ring and outlives all CQEs.
-                    unsafe { timeout.prepare(sqe) };
-                },
-            )?;
-        }
-        proactor.submit()?;
-        let mut completed = 0;
-        let error =
-            proactor.shutdown_with(&mut |cqe: Completion, _: &mut SubmissionContext<'_>| {
-                assert_eq!(cqe.result, -libc::ECANCELED);
-                completed += 1;
-                Err(UringError::InvalidConfig("dispatcher interrupted teardown"))
-            });
-        assert_eq!(
-            error,
-            Err(UringError::InvalidConfig("dispatcher interrupted teardown"))
-        );
-        assert!(proactor.shutdown_cancel_issued);
-        proactor.shutdown_with(&mut |cqe: Completion, _: &mut SubmissionContext<'_>| {
-            assert_eq!(cqe.result, -libc::ECANCELED);
-            completed += 1;
-            Ok(())
-        })?;
-        assert_eq!(completed, 48);
-        assert!(proactor.shutdown_cancel_issued);
-        assert!(!proactor.cancel_armed);
-        assert!(proactor.is_idle());
-        Ok(())
-    }
-}
+#[path = "../../tests/proactor/shutdown.rs"]
+mod tests;

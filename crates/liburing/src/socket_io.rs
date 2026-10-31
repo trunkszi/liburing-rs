@@ -149,10 +149,16 @@ pub struct CompletionSocketIo {
 impl CompletionSocketIo {
     /// Registers proactor-owned fixed send memory and a provided receive group.
     /// # Errors
-    /// Returns invalid budgets, group conflicts, allocation, or kernel errors.
+    /// Returns mode, invalid budget, group conflict, allocation, or kernel errors.
     /// # Panics
     /// May panic on allocation failure.
     pub fn new(proactor: &mut Proactor, config: SocketIoConfig) -> Result<Self> {
+        if !proactor.mode().supports_sockets_and_timers() {
+            return Err(UringError::OpcodeNotAdmitted {
+                opcode: io_uring::opcode::Recv::CODE,
+                mode: proactor.mode().name(),
+            });
+        }
         if config.subsystem == SubsystemId::INTERNAL
             || config.sockets == 0
             || config.sockets > u32::MAX as usize

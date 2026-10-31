@@ -61,33 +61,27 @@ pub const IORING_SETUP_TASKRUN_FLAG: u32 = 1 << 9;
 pub const IORING_SETUP_DEFER_TASKRUN: u32 = 1 << 13;
 pub const IORING_RECV_MULTISHOT: u16 = 2;
 
-/// Runs deferred kernel task work without waiting for an I/O completion.
-pub(crate) trait SynchronousTaskrun {
-    fn synchronous_taskrun(&self) -> std::io::Result<usize>;
-}
+pub const IORING_SETUP_IOPOLL: u32 = 1;
+pub const IORING_SETUP_SQPOLL: u32 = 1 << 1;
+pub const IORING_SETUP_SQ_AFF: u32 = 1 << 2;
+pub const IORING_SETUP_CLAMP: u32 = 1 << 4;
+pub const IORING_SETUP_SUBMIT_ALL: u32 = 1 << 7;
+pub const IORING_SETUP_NO_SQARRAY: u32 = 1 << 16;
+pub const IORING_FEAT_MIN_TIMEOUT: u32 = 1 << 15;
+pub const IORING_FEAT_NO_IOWAIT: u32 = 1 << 17;
 
-impl SynchronousTaskrun for io_uring::Submitter<'_> {
-    fn synchronous_taskrun(&self) -> std::io::Result<usize> {
-        flush_task_work(|| {
-            // SAFETY: Submit no entries, request no minimum CQEs, and pass no signal
-            // mask. GETEVENTS executes deferred task work without waiting for I/O.
-            unsafe {
-                self.enter::<libc::sigset_t>(0, 0, io_uring::EnterFlags::GETEVENTS.bits(), None)
-            }
-        })
-    }
-}
-
-fn flush_task_work(mut enter: impl FnMut() -> std::io::Result<usize>) -> std::io::Result<usize> {
-    loop {
-        match enter() {
-            Err(error) if error.raw_os_error() == Some(libc::EINTR) => continue,
-            Err(error) if matches!(error.raw_os_error(), Some(libc::EAGAIN | libc::EBUSY)) => {
-                return Ok(0);
-            }
-            result => return result,
+pub(crate) fn enter_result(result: std::io::Result<usize>, waiting: bool) -> crate::Result<usize> {
+    result.or_else(|error| {
+        let errno = error.raw_os_error().unwrap_or(libc::EIO);
+        match errno {
+            libc::EINTR | libc::EAGAIN | libc::EBUSY => Ok(0),
+            libc::ETIME if waiting => Ok(0),
+            libc::EBADR => Err(crate::UringError::CompletionsDropped),
+            libc::EOWNERDEAD => Err(crate::UringError::SqThreadGone),
+            _ if waiting => Err(crate::UringError::Wait(errno)),
+            _ => Err(crate::UringError::Submit(errno)),
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -95,34 +89,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_work_retries_signals_and_defers_kernel_backpressure() {
-        let mut calls = 0;
-        let result = flush_task_work(|| {
-            calls += 1;
-            if calls < 3 {
-                Err(std::io::Error::from_raw_os_error(libc::EINTR))
-            } else {
-                Ok(7)
+    fn enter_result_maps_error_classes() {
+        use crate::UringError;
+
+        let cases = [
+            (libc::EINTR, Ok(0), Ok(0)),
+            (libc::EAGAIN, Ok(0), Ok(0)),
+            (libc::EBUSY, Ok(0), Ok(0)),
+            (libc::ETIME, Err(UringError::Submit(libc::ETIME)), Ok(0)),
+            (
+                libc::EBADR,
+                Err(UringError::CompletionsDropped),
+                Err(UringError::CompletionsDropped),
+            ),
+            (
+                libc::EOWNERDEAD,
+                Err(UringError::SqThreadGone),
+                Err(UringError::SqThreadGone),
+            ),
+            (
+                libc::EINVAL,
+                Err(UringError::Submit(libc::EINVAL)),
+                Err(UringError::Wait(libc::EINVAL)),
+            ),
+        ];
+        for (errno, submitting, waiting) in cases {
+            for (is_wait, expected) in [(false, submitting), (true, waiting)] {
+                let result = enter_result(Err(std::io::Error::from_raw_os_error(errno)), is_wait);
+                assert_eq!(result, expected, "errno={errno}, waiting={is_wait}");
             }
-        });
-        assert_eq!(result.ok(), Some(7));
-        assert_eq!(calls, 3);
-        for error in [libc::EAGAIN, libc::EBUSY] {
+        }
+        for waiting in [false, true] {
+            assert_eq!(enter_result(Ok(7), waiting), Ok(7));
+            let expected = if waiting {
+                UringError::Wait(libc::EIO)
+            } else {
+                UringError::Submit(libc::EIO)
+            };
             assert_eq!(
-                flush_task_work(|| Err(std::io::Error::from_raw_os_error(error))).ok(),
-                Some(0)
+                enter_result(Err(std::io::Error::other("no numeric errno")), waiting),
+                Err(expected)
             );
         }
-        assert_eq!(
-            flush_task_work(|| Err(std::io::Error::from_raw_os_error(libc::EBADF)))
-                .err()
-                .and_then(|error| error.raw_os_error()),
-            Some(libc::EBADF)
-        );
     }
 
     #[test]
-    fn native_entry_layout_and_every_exposed_field_round_trip() {
+    fn native_fields_round_trip() {
         assert_eq!(std::mem::size_of::<RawSqe>(), 64);
         assert_eq!(
             std::mem::align_of::<RawSqe>(),

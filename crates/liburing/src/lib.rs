@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod buffer_ring;
 pub mod config;
+pub mod direct_file;
 pub mod error;
 pub mod fixed_buffers;
 pub mod fixed_files;
@@ -19,11 +20,14 @@ pub mod socket_io;
 pub mod subsystem;
 
 pub use buffer_ring::{BufferLease, BufferRing};
-pub use config::{KernelFeatures, ProactorBuilder, ProactorConfig};
+pub use config::{
+    EventDrivenConfig, KernelFeatures, ProactorBuilder, ProactorConfig, ProactorMode, SqPollConfig,
+};
+pub use direct_file::{DirectAccess, DirectFile};
 pub use error::{Result, UringError};
 pub use id::{
     BufferGroupId, BufferId, OperationId, OperationPayload, OperationPayloadCodec, SubsystemId,
     UringFileSlot,
 };
-pub use proactor::Proactor;
+pub use proactor::{Proactor, ProactorStats};
 pub use subsystem::{Completion, CompletionDispatcher, SubmissionContext};
